@@ -33,8 +33,12 @@ While basic modem functions (AT commands, SMS, audio calls) can work through sha
 * **Downlink (RX):** Inbound traffic reception remains unverified until outgoing traffic can traverse the IPA pipe.
 * **Router Setup:** Network routing, NAT masquerading (`nftables`), DHCP server (`dnsmasq`), and Wi-Fi hotspot (`hostapd`) were deferred pending working bidirectional packet flow.
 
-## Patch Series Summary
+## Patch Series & Revisions
 
+* **Patch count:** 28 patches (`01-ipa2-lite-driver.patch` to `28-sdm660-ipa-sync-tx-buffer.patch`).
+* **Package revisions & builds:** The postmarketOS kernel package went through multiple iterative test builds from `r44` up to `r61` (`pkgrel=61`, kernel build `#62`). Milestone builds included `r50` (kernel build `#51`, system-header fix), `r52` (kernel build `#53`, QMI filter decoding), and `r61` (final BAM DMA sync and FIFO adjustments).
+
+### Patch Summary:
 * `01-03`: Initial `ipa2-lite` driver import and mainline SDM630/SDM660 device tree IPA / uC SMMU node bindings.
 * `04-06`: Downstream SDM660 IPA 2.6L component reset values, bus interconnect voting, and filter engine enablement.
 * `07-13`: QMAP big-endian header handling, uC event/response interrupt handling, downstream-matching TX completion polling, and system pipe routing.
@@ -43,6 +47,10 @@ While basic modem functions (AT commands, SMS, audio calls) can work through sha
 * `23`: PM8998/PM660 PS_HOLD power-off handling.
 * `24-26`: Filter table reassertion and unconditional catch-all rule encoding.
 * `27-28`: AP TX descriptor FIFO adjustment and DMA buffer synchronization.
+
+## Device Package (`device-xiaomi-lavender`)
+
+The accompanying `device-xiaomi-lavender/` directory contains the postmarketOS device package with `ipa2-lite` enabled in `modules-initfs` (for Tianma, Shenchao, and BOE display panel variants) to ensure the IPA driver is loaded early during the initramfs stage.
 
 ## Building with pmbootstrap
 
