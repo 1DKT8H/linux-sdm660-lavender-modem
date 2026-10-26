@@ -1,0 +1,148 @@
+From 6d4e66c36f2a0d755296df19044d2dbd1d34a039 Mon Sep 17 00:00:00 2001
+From: 1DKT8H <szymonj159@gmail.com>
+Date: Sun, 30 Aug 2026 18:30:00 +0200
+Subject: [PATCH] net: ipa2-lite: match downstream TX setup and safe SSR
+
+Program every APPS_LAN_WAN_PROD endpoint register written by the SDM660
+downstream driver instead of relying on reset values for aggregation,
+checksum, NAT and deaggregation state.
+
+Do not directly reset Q6-owned BAM pipes when the IPA microcontroller is
+unavailable.  Downstream deliberately skips the reset in that case because
+the uC serializes it with traffic; a direct reset can race modem firmware and
+lock the shared IPA block during SSR.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+---
+ drivers/net/ipa2-lite/ipa.c | 71 ++++++++++++++++++++-----------------------
+ 1 file changed, 33 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+index 8277fd66b81a..a23ad9355ee5 100644
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -760,13 +762,22 @@ static int ipa_setup_ep(struct ipa *ipa, enum ipa_ep_id id)
+ 		break;
+ 	case EP_TX:
+ 	case EP_TEST_TX:
++		/*
++		 * Mirror ipa2_cfg_ep() for APPS_LAN_WAN_PROD.  In particular,
++		 * don't depend on reset values for registers that downstream
++		 * programs explicitly before connecting the system BAM pipe.
++		 */
+ 		iowrite32(ipa->test_mode ? 0xc4 : 0x44, ipa->mmio + REG_IPA_EP_HDR(id));
+ 		/* Downstream encodes big-endian QMAP as HDR_ENDIANNESS = 1. */
+ 		iowrite32(0x00000001, ipa->mmio + REG_IPA_EP_HDR_EXT(id));
++		iowrite32(0x00000000, ipa->mmio + REG_IPA_EP_AGGR(id));
++		iowrite32(0x00000000, ipa->mmio + REG_IPA_EP_CFG(id));
++		iowrite32(0x00000000, ipa->mmio + REG_IPA_EP_NAT(id));
++		iowrite32(0x00000020, ipa->mmio + REG_IPA_EP_MODE(id));
++		iowrite32(0x00000007, ipa->mmio + REG_IPA_EP_ROUTE(id));
++		iowrite32(0x00000000, ipa->mmio + REG_IPA_EP_DEAGGR(id));
+ 		/* APPS_LAN_WAN_PROD does not generate IPA status indications. */
+ 		iowrite32(0x00000000, ipa->mmio + REG_IPA_EP_STATUS(id));
+-		iowrite32(0x00000007, ipa->mmio + REG_IPA_EP_ROUTE(id));
+-		iowrite32(0x00000020, ipa->mmio + REG_IPA_EP_MODE(id));
+ 		break;
+ 	case EP_RX:
+ 	case EP_TEST_RX:
+@@ -909,48 +920,34 @@ static int ipa_uc_send_cmd(struct ipa *ipa, u8 cmd_op, u32 cmd_param, u32 resp_s
+ 	return 0;
+ }
+ 
+-static void ipa_bam_reset_q6_pipe(struct ipa *ipa, u8 pipe)
+-{
+-	void __iomem *mmio = ipa->mmio;
+-	u32 rd_off, wr_off;
+-
+-	iowrite32(0, mmio + REG_BAM_P_CTRL(pipe));
+-	iowrite32(1, mmio + REG_BAM_P_RST(pipe));
+-	wmb();
+-	iowrite32(0, mmio + REG_BAM_P_RST(pipe));
+-	iowrite32(0, mmio + REG_BAM_P_RD_OFF_REG(pipe));
+-	iowrite32(0, mmio + REG_BAM_P_WR_OFF_REG(pipe));
+-	wmb();
+-
+-	rd_off = ioread32(mmio + REG_BAM_P_RD_OFF_REG(pipe));
+-	wr_off = ioread32(mmio + REG_BAM_P_WR_OFF_REG(pipe));
+-	dev_warn(ipa->dev,
+-		 "uC unavailable; reset Q6 BAM pipe %u directly (rd=%#x wr=%#x)\n",
+-		 pipe, rd_off, wr_off);
+-}
+-
+-static void ipa_reset_modem_pipes(struct ipa *ipa)
++static int ipa_reset_modem_pipes(struct ipa *ipa)
+ {
+ 	/* For 2.5+ */
+ 	u8 pipes[] = { 6, 7, 11, 13, 8, 9, 12, 14 };
+-	bool direct_reset = false;
+ 	int i, ret;
+ 
+-	for (i = 0; i < ARRAY_SIZE(pipes); i++) {
+-		if (direct_reset) {
+-			ipa_bam_reset_q6_pipe(ipa, pipes[i]);
+-			continue;
+-		}
++	/*
++	 * Downstream skips the cleanup if the uC is unavailable.  Resetting a
++	 * Q6-owned BAM pipe directly can race firmware and lock the shared IPA
++	 * block, which is worse than leaving cleanup for the next full reset.
++	 */
++	if (!ipa->uc_loaded) {
++		dev_warn(ipa->dev, "uC unavailable; skip Q6 pipe reset\n");
++		return -ENODEV;
++	}
+ 
++	for (i = 0; i < ARRAY_SIZE(pipes); i++) {
+ 		ret = ipa_uc_send_cmd(ipa, IPA_UC_CMD_RESET_PIPE,
+ 				      IPA_UC_CMD_RESET_PIPE_PARAM(pipes[i], i >= 4), 0);
+ 		if (ret) {
+-			dev_err(ipa->dev, "failed to reset %d pipe: %d\n",
++			dev_err(ipa->dev,
++				"failed to reset Q6 pipe %u through uC: %d; abort cleanup\n",
+ 				pipes[i], ret);
+-			direct_reset = true;
+-			ipa_bam_reset_q6_pipe(ipa, pipes[i]);
++			return ret;
+ 		}
+ 	}
++
++	return 0;
+ }
+ 
+ static void ipa_partition_put(struct ipa *ipa, u32 *offset,
+@@ -1259,8 +1256,8 @@ static int ipa_ssr_notifier(struct notifier_block *nb,
+ 	if (action == QCOM_SSR_BEFORE_SHUTDOWN) {
+ 		ipa_modem_set_present(ipa->dev, false);
+ 	} else if (action == QCOM_SSR_AFTER_SHUTDOWN) {
+-		ipa_reset_modem_pipes(ipa);
+-		ipa_init_sram(ipa);
++		if (!ipa_reset_modem_pipes(ipa))
++			ipa_init_sram(ipa);
+ 	} else {
+ 		return NOTIFY_DONE;
+ 	}
+@@ -1286,7 +1283,7 @@ static irqreturn_t ipa_isr_thread(int irq, void *data)
+ 				  ipa->mmio + REG_IPA_IRQ_CLR_EE0);
+ 			event = ioread32(ipa->mmio + REG_IPA_UC_EVENT);
+ 			event_param = ioread32(ipa->mmio + REG_IPA_UC_EVENT_PARAM);
+-			dev_err(ipa->dev,
++			dev_info(ipa->dev,
+ 				"uC event: opcode=%#x params=%#x irq_status=%#x\n",
+ 				event, event_param, pending);
+ 		}
+@@ -1313,9 +1310,9 @@ static irqreturn_t ipa_isr_thread(int irq, void *data)
+ 	/* Status includes disabled conditions; don't leave stale bits latched. */
+ 	pending = ioread32(ipa->mmio + REG_IPA_IRQ_STTS_EE0);
+ 	if (pending) {
+-		dev_warn_ratelimited(ipa->dev,
+-				     "clearing disabled IPA interrupts %#x (enabled %#x)\n",
+-				     pending, enabled);
++		dev_dbg(ipa->dev,
++			"clearing disabled IPA interrupts %#x (enabled %#x)\n",
++			pending, enabled);
+ 		iowrite32(pending, ipa->mmio + REG_IPA_IRQ_CLR_EE0);
+ 	}
+ 
+-- 
+2.51.0

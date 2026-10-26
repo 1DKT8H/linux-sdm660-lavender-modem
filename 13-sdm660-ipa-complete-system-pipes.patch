@@ -1,0 +1,264 @@
+From 8b8a27bb1f45f7fb03b74055121c34e50931d313 Mon Sep 17 00:00:00 2001
+From: 1DKT8H <szymonj159@gmail.com>
+Date: Wed, 2 Sep 2026 08:50:00 +0200
+Subject: [PATCH] net: ipa2-lite: complete SDM660 AP system-pipe setup
+
+Match the IPA 2.6L downstream ownership and system-pipe setup before
+submitting modem traffic. Keep APPS_LAN_CONS active as the status sink,
+restore endpoint status and aggregation configuration, parse WAN status
+records, leave Q6-owned SRAM intact, and avoid claiming unused test pipes.
+
+Add a one-shot dump of the AP-owned IPA execution environment and relevant
+system pipes at first TX without relying on an external diagnostic module
+(which is incompatible with kernel CFI).
+---
+ drivers/net/ipa2-lite/ipa.c | 141 +++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 136 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -34,7 +35,8 @@
+ #define IPA_FIFO_SIZE			(IPA_FIFO_NUM_DESC * sizeof(struct fifo_desc))
+ #define IPA_FIFO_NEXT_IDX(idx)		(((idx) + 1) & IPA_FIFO_IDX_MASK)
+ #define IPA_NUM_PIPES			(20)
+-#define IPA_RX_LEN			(2048)
++#define IPA_RX_LEN			(8192)
++#define IPA_NET_MTU			(2048 - IPA_PKT_STATUS_SIZE - 4)
+ #define IPA_TX_STOP_FREE_THRESH		(0)
+ #define IPA_PIPE_IRQ_MASK		(P_PRCSD_DESC_EN | P_ERR_EN | P_TRNSFR_END_EN)
+ #define EP_DMA_DIR(ep)			((ep)->is_rx ? DMA_FROM_DEVICE : DMA_TO_DEVICE)
+@@ -757,6 +759,8 @@
+ 		iowrite32(0x00000002, ipa->mmio + REG_IPA_EP_HDR(id));
+ 		iowrite32(0x00000803, ipa->mmio + REG_IPA_EP_HDR_EXT(id));
+ 		iowrite32(0x00000000, ipa->mmio + REG_IPA_EP_HDR_METADATA_MASK(id));
++		/* Downstream APPS_LAN_CONS: generic aggregation, 6 KiB/1 us. */
++		iowrite32(0x000004d1, ipa->mmio + REG_IPA_EP_AGGR(id));
+ 		iowrite32(0x00000001, ipa->mmio + REG_IPA_EP_STATUS(id));
+ 		break;
+ 	case EP_TX:
+@@ -775,15 +779,20 @@
+ 		iowrite32(0x00000020, ipa->mmio + REG_IPA_EP_MODE(id));
+ 		iowrite32(0x00000007, ipa->mmio + REG_IPA_EP_ROUTE(id));
+ 		iowrite32(0x00000000, ipa->mmio + REG_IPA_EP_DEAGGR(id));
+-		/* APPS_LAN_WAN_PROD does not generate IPA status indications. */
+-		iowrite32(0x00000000, ipa->mmio + REG_IPA_EP_STATUS(id));
++		/* Downstream routes producer completion/status records to pipe 2. */
++		iowrite32(0x00000005, ipa->mmio + REG_IPA_EP_STATUS(id));
+ 		break;
+ 	case EP_RX:
+ 	case EP_TEST_RX:
++		ep->has_status = 1;
+ 		iowrite32(0x002800c4, ipa->mmio + REG_IPA_EP_HDR(id));
+ 		/* Total-length valid, payload padding and big-endian QMAP. */
+ 		iowrite32(0x0000000b, ipa->mmio + REG_IPA_EP_HDR_EXT(id));
+ 		iowrite32(0xff000000, ipa->mmio + REG_IPA_EP_HDR_METADATA_MASK(id));
++		/* Downstream APPS_WAN_CONS aggregation plus software-EOF close. */
++		iowrite32(0x002004d1, ipa->mmio + REG_IPA_EP_AGGR(id));
++		iowrite32(0x00000001, ipa->mmio + REG_IPA_EP_STATUS(id));
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -1078,6 +1087,11 @@
+ 	int ret, reserved;
+ 	union ipa_cmd *cmd;
+ 
++	/* These regions belong to Q6 on IPA 2.6L; downstream never clears them. */
++	if (ipa->version == 26 &&
++	    (mem_id == MEM_MDM_COMP || mem_id == MEM_MDM))
++		return 0;
++
+ 	if (!part->size)
+ 		return 0;
+ 
+@@ -1415,6 +1429,73 @@
+ 	return done;
+ }
+ 
++static void ipa_receive_status_skb(struct ipa_ep *ep, struct net_device *ndev,
++				   struct sk_buff *skb, u32 *packets, u32 *bytes)
++{
++	struct ipa_hw_pkt_status *status;
++	struct sk_buff *packet;
++	u32 frame_len, qmap_len;
++
++	/* Pipe 2 is the always-on status/completion sink used by pipe 4. */
++	if (ep->id == EP_LAN_RX) {
++		dev_kfree_skb_any(skb);
++		return;
++	}
++
++	while (skb->len >= IPA_PKT_STATUS_SIZE) {
++		status = (struct ipa_hw_pkt_status *)skb->data;
++
++		if (status->pkt_len == 0) {
++			skb_pull(skb, IPA_PKT_STATUS_SIZE);
++			continue;
++		}
++
++		if (status->endp_dest_idx != ep->id ||
++		    status->pkt_len > 6 * 1024 ||
++		    skb->len < IPA_PKT_STATUS_SIZE + 4) {
++			dev_warn_ratelimited(ep->ipa->dev,
++				"invalid IPA status on pipe %u: op=%u src=%u dst=%u len=%u remaining=%u\n",
++				ep->id, status->status_opcode,
++				status->endp_src_idx, status->endp_dest_idx,
++				status->pkt_len, skb->len);
++			break;
++		}
++
++		/* Match ipa_wan_rx_pyld_hdlr(): QMAP length is big endian. */
++		qmap_len = get_unaligned_be16(skb->data + IPA_PKT_STATUS_SIZE + 2);
++		frame_len = IPA_PKT_STATUS_SIZE + 4 + qmap_len;
++		if (status->status_mask & IPA_HW_PKT_STATUS_MASK_CKSUM_PROCESS)
++			frame_len += 8;
++
++		if (frame_len > skb->len) {
++			dev_warn_ratelimited(ep->ipa->dev,
++				"split IPA frame on pipe %u: need=%u remaining=%u\n",
++				ep->id, frame_len, skb->len);
++			break;
++		}
++
++		if (status->status_opcode == IPA_HW_STATUS_OPCODE_PACKET ||
++		    status->status_opcode == IPA_HW_STATUS_OPCODE_XLAT_PACKET) {
++			packet = netdev_alloc_skb(ndev,
++						 frame_len - IPA_PKT_STATUS_SIZE);
++			if (packet) {
++				skb_put_data(packet,
++					     skb->data + IPA_PKT_STATUS_SIZE,
++					     frame_len - IPA_PKT_STATUS_SIZE);
++				packet->dev = ndev;
++				packet->protocol = htons(ETH_P_MAP);
++				(*packets)++;
++				*bytes += packet->len;
++				netif_receive_skb(packet);
++			}
++		}
++
++		skb_pull(skb, frame_len);
++	}
++
++	dev_kfree_skb_any(skb);
++}
++
+ static int ipa_poll_rx(struct napi_struct *napi, int budget)
+ {
+ 	struct ipa_ep *ep = container_of(napi, struct ipa_ndev, napi_rx)->rx;
+@@ -1466,7 +1547,7 @@
+ 			bytes += skb->len;
+ 			netif_receive_skb(skb);
+ 		} else {
+-			dev_kfree_skb_any(skb);
++			ipa_receive_status_skb(ep, ndev, skb, &packets, &bytes);
+ 		}
+ 
+ 		skb = new_skb;
+@@ -1637,6 +1718,21 @@ static int ipa_ndev_open(struct net_device *ndev)
+ 	bool filters_ready = false;
+ 	int ret = 0;
+ 
++	/*
++	 * Pipe 4 sends its completion records to pipe 2.  Downstream brings
++	 * APPS_LAN_CONS up before APPS_LAN_WAN_PROD can carry traffic.  Do
++	 * the same here, but only when the modem netdev is opened: at this
++	 * point probe and QMI setup have completed, unlike an eager dev_open()
++	 * from the middle of the platform probe.
++	 */
++	if (ipa_ndev->tx && !netif_running(ipa->lan)) {
++		ret = dev_open(ipa->lan, NULL);
++		if (ret) {
++			netdev_err(ndev, "failed to start IPA status sink: %d\n", ret);
++			return ret;
++		}
++	}
++
+ 	if (!ipa_ndev->rx->skbs) {
+ 		ipa_ndev->rx->skbs = devm_kzalloc(ipa->dev,
+ 				sizeof(struct sk_buff) * IPA_FIFO_NUM_DESC,
+@@ -1666,6 +1761,26 @@
+ 		ipa_ndev_stop(ndev);
+ }
+ 
++static void ipa_dump_first_tx_state(struct ipa *ipa)
++{
++	/* AP owns EE0; touching Q6/uC EE banks from AP is not supported. */
++	dev_info(ipa->dev, "first TX EE0: status=%#x enabled=%#x\n",
++		 ioread32(ipa->mmio + REG_IPA_IRQ_STTS_EE0),
++		 ioread32(ipa->mmio + REG_IPA_IRQ_EN_EE0));
++
++	dev_info(ipa->dev,
++		 "first TX pipes: p2 ctrl=%#x irq=%#x status=%#x; p4 ctrl=%#x irq=%#x status=%#x; p5 ctrl=%#x irq=%#x status=%#x\n",
++		 ioread32(ipa->mmio + REG_BAM_P_CTRL(EP_LAN_RX)),
++		 ioread32(ipa->mmio + REG_BAM_P_IRQ_EN(EP_LAN_RX)),
++		 ioread32(ipa->mmio + REG_IPA_EP_STATUS(EP_LAN_RX)),
++		 ioread32(ipa->mmio + REG_BAM_P_CTRL(EP_TX)),
++		 ioread32(ipa->mmio + REG_BAM_P_IRQ_EN(EP_TX)),
++		 ioread32(ipa->mmio + REG_IPA_EP_STATUS(EP_TX)),
++		 ioread32(ipa->mmio + REG_BAM_P_CTRL(EP_RX)),
++		 ioread32(ipa->mmio + REG_BAM_P_IRQ_EN(EP_RX)),
++		 ioread32(ipa->mmio + REG_IPA_EP_STATUS(EP_RX)));
++}
++
+ static netdev_tx_t ipa_ndev_start_xmit(struct sk_buff *skb,
+ 				       struct net_device *ndev)
+ {
+@@ -1681,11 +1785,8 @@
+ 
+ 	if (!ipa->tx_irq_logged) {
+ 		ipa->tx_irq_logged = true;
+-		dev_info(ipa->dev,
+-			 "first modem TX: len=%u irq_status=%#x irq_enabled=%#x\n",
+-			 skb->len,
+-			 ioread32(ipa->mmio + REG_IPA_IRQ_STTS_EE0),
+-			 ioread32(ipa->mmio + REG_IPA_IRQ_EN_EE0));
++		dev_info(ipa->dev, "first modem TX: len=%u\n", skb->len);
++		ipa_dump_first_tx_state(ipa);
+ 	}
+ 
+ 	ret = ipa_enqueue_skb(skb, ndev, ipa_ndev->tx);
+@@ -1716,7 +1817,7 @@
+ 	ndev->hard_header_len = 0;
+ 	ndev->min_header_len = ETH_HLEN;
+ 	ndev->needed_headroom = 8; /* Downstream HEADROOM_FOR_QMAP */
+-	ndev->mtu = IPA_RX_LEN - 32 - 4; /* STATUS + QMAP_HDR */
++	ndev->mtu = IPA_NET_MTU;
+ 	ndev->max_mtu = ndev->mtu;
+ 	ndev->needed_tailroom = 0;
+ 	ndev->priv_flags |= IFF_TX_SKB_SHARING;
+@@ -1913,6 +2014,10 @@
+ 	}
+ 
+ 	for (ep = 0; ep < EP_NUM; ep++) {
++		if (!ipa->test_mode &&
++		    (ep == EP_TEST_TX || ep == EP_TEST_RX))
++			continue;
++
+ 		ret = ipa_setup_ep(ipa, ep);
+ 		if (ret)
+ 			return ret;
+@@ -1959,15 +2067,16 @@ static int ipa_probe(struct platform_device *pdev)
+ 			return PTR_ERR(ipa->loopback);
+ 	}
+ 
+-	ipa->modem = ipa_create_netdev(dev, name, ipa->ep + EP_RX,
+-				       ipa->ep + EP_TX);
+-	if (IS_ERR(ipa->modem))
+-		return PTR_ERR(ipa->modem);
+-
++	/* Register the status sink before publishing the modem data netdev. */
+ 	ipa->lan = ipa_create_netdev(dev, "ipa_lan%d", ipa->ep + EP_LAN_RX, NULL);
+ 	if (IS_ERR(ipa->lan))
+ 		return PTR_ERR(ipa->lan);
+ 
++	ipa->modem = ipa_create_netdev(dev, name, ipa->ep + EP_RX,
++				       ipa->ep + EP_TX);
++	if (IS_ERR(ipa->modem))
++		return PTR_ERR(ipa->modem);
++
+ 	if (ipa->test_mode)
+ 		return 0;
+ 	else
+-- 
+2.51.0

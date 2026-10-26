@@ -1,0 +1,28 @@
+From: 1DKT8H <szymonj159@gmail.com>
+Subject: [PATCH] net: ipa2-lite: synchronize mapped TX buffers before BAM
+
+The AP BAM producer reads packet buffers through the IPA SMMU stream.  Make
+the DMA ownership transition explicit after mapping the skb and before
+publishing its descriptor to BAM.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+---
+ drivers/net/ipa2-lite/ipa.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -3008,6 +3008,12 @@ static int ipa_enqueue_skb(struct sk_buff *skb, struct net_device *ndev, struct ipa_ep *ep)
+ 	if (dma_mapping_error(dev, addr))
+ 		goto free_skb;
+ 
++	/*
++	 * Keep the payload visible to the AP BAM producer before its descriptor
++	 * is published through the event register.
++	 */
++	dma_sync_single_for_device(dev, addr, len, DMA_TO_DEVICE);
++
+ 	desc.addr = addr;
+ 	desc.size = len;
+ 	desc.flags = ep->is_rx ? DESC_FLAG_INT : DESC_FLAG_EOT;

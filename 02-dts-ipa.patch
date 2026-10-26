@@ -1,0 +1,40 @@
+From 49a383add9e67a35b219c68ff6204a8ed54ef6b8 Mon Sep 17 00:00:00 2001
+From: ZXlieC <xlie7669@gmail.com>
+Date: Thu, 11 Dec 2025 19:09:07 +0200
+Subject: [PATCH] arm64: dts: qcom: sdm630: add partial IPA driver support
+
+Add partial IPA driver support. Mobile data don`t works because ipa-lite driver don`t support probing uc smmu (which is required for sdm660/636/630 platforms), so this driver just helps Modem Manager to see modem in system. Other feautures like calls, USSD and SMS works well!
+
+Signed-off-by: Nazar Kompanets <xlie7669@gmail.com>
+---
+ arch/arm64/boot/dts/qcom/sdm630.dtsi | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm630.dtsi b/arch/arm64/boot/dts/qcom/sdm630.dtsi
+index 56ee3991b4e1b9..860a9ce0e7d4ef 100644
+--- a/arch/arm64/boot/dts/qcom/sdm630.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm630.dtsi
+@@ -1037,6 +1037,23 @@
+ 			};
+ 		};
+ 
++		ipa: ipa@14780000 {
++			compatible = "qcom,ipa-lite-v2.6";
++			reg = <0x14780000 0x47000>;
++			clocks = <&rpmcc RPM_SMD_IPA_CLK>;
++			interrupts = <GIC_SPI 333 IRQ_TYPE_EDGE_RISING>,
++			<GIC_SPI 432 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "ipa", "dma";
++			interconnects =  <&a2noc MASTER_IPA &bimc SLAVE_EBI>,
++			<&a2noc MASTER_IPA &snoc SLAVE_IMEM>,
++			<&gnoc MASTER_APSS_PROC &snoc SLAVE_IPA>;
++			interconnect-names = "ipa-mem", "ipa-imem", "cpu-cfg";
++			iommus =  <&anoc2_smmu 0x19C0>,
++					  <&anoc2_smmu 0x19C2>;
++			modem-remoteproc = <&remoteproc_mss>;
++			status = "okay";
++		};
++
+ 		remoteproc_mss: remoteproc@4080000 {
+ 			compatible = "qcom,sdm660-mss-pil";
+ 			reg = <0x04080000 0x100>, <0x04180000 0x40>;

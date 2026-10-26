@@ -1,0 +1,88 @@
+From: 1DKT8H <szymonj159@gmail.com>
+Subject: [PATCH] net: ipa2-lite: enable the SDM660 filtering datapath
+
+The modem supplies embedded producer filters and programs its routing tables,
+but IPA-lite leaves the global filtering block disabled after the component
+reset.  Packets submitted on APPS_LAN_WAN_PROD therefore complete in BAM and
+fall through to the empty AP route table instead of the modem route selected
+by its filter rules.
+
+Enable IPA filtering as the downstream ipa_cfg_filter(0) path does.  Also use
+the SDM660 downstream IPA 2.6L active and SVS clock rates; the original 40 MHz
+rate is below downstream's 75 MHz minimum operating point.
+
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+index 6bcde4227..cde1de9d9 100644
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -41,6 +41,10 @@
+ #define IPA_QMI_FILTER_TABLE_SIZE	8192
+ #define IPA_QMI_MODEM_ROUTE_MAX		6
+ #define IPA_INTERCONNECT_COUNT		3
++#define IPA_V2_6L_ACTIVE_CLK_RATE	200000000UL
++#define IPA_V2_6L_IDLE_CLK_RATE		75000000UL
++#define IPA_LEGACY_ACTIVE_CLK_RATE	40000000UL
++#define IPA_LEGACY_IDLE_CLK_RATE	9600000UL
+ 
+ #define IPA_V2_6L_SMEM_SIZE		0x2000
+ #define IPA_V2_6L_V4_FT_OFF		0x288
+@@ -655,6 +659,9 @@ static void ipa_reset_hw(struct ipa *ipa)
+ 	if (ipa->version >= 25)
+ 		iowrite32(0x1fff7f, ipa->mmio + REG_IPA_BCR_OFST);
+ 
++	/* Downstream enables the filter block before programming rules. */
++	iowrite32(1, ipa->mmio + REG_IPA_FILTER_OFST);
++
+ 	iowrite32(BAM_SW_RST, ipa->mmio + REG_BAM_CTRL);
+ 	iowrite32(0, ipa->mmio + REG_BAM_CTRL);
+ 
+@@ -668,6 +675,16 @@ static void ipa_reset_hw(struct ipa *ipa)
+ 	iowrite32(BAM_IRQ, ipa->mmio + REG_BAM_IRQ_SRCS_MSK_EE0);
+ }
+ 
++static unsigned long ipa_clk_rate(struct ipa *ipa, bool active)
++{
++	if (ipa->version == 26)
++		return active ? IPA_V2_6L_ACTIVE_CLK_RATE :
++				IPA_V2_6L_IDLE_CLK_RATE;
++
++	return active ? IPA_LEGACY_ACTIVE_CLK_RATE :
++			IPA_LEGACY_IDLE_CLK_RATE;
++}
++
+ static inline u32 ipa_fifo_offset(void __iomem *reg)
+ {
+ 	u32 off = readl_relaxed(reg) & 0xffff;
+@@ -1809,7 +1826,10 @@ static int ipa_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, PTR_ERR(ipa->clk),
+ 				     "failed to get clock\n");
+ 
+-	clk_set_rate(ipa->clk, 40000000);
++	ret = clk_set_rate(ipa->clk, ipa_clk_rate(ipa, true));
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "failed to set active IPA clock rate\n");
+ 
+ 	dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+ 
+@@ -1937,18 +1957,14 @@ static int ipa_runtime_resume(struct device *dev)
+ {
+ 	struct ipa *ipa = dev_get_drvdata(dev);
+ 
+-	clk_set_rate(ipa->clk, 40000000);
+-
+-	return 0;
++	return clk_set_rate(ipa->clk, ipa_clk_rate(ipa, true));
+ }
+ 
+ static int ipa_runtime_suspend(struct device *dev)
+ {
+ 	struct ipa *ipa = dev_get_drvdata(dev);
+ 
+-	clk_set_rate(ipa->clk, 9600000);
+-
+-	return 0;
++	return clk_set_rate(ipa->clk, ipa_clk_rate(ipa, false));
+ }
+ 
+ static int ipa_system_resume(struct device *dev)

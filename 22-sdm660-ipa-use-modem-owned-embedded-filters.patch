@@ -1,0 +1,31 @@
+From: 1DKT8H <szymonj159@gmail.com>
+Subject: [PATCH] arm64: dts: qcom: sdm630: let modem own pipe filters
+
+The downstream SDM630/660 IPA node declares
+qcom,modem-cfg-emb-pipe-flt.  On these platforms Q6/uC programs the
+embedded filtering table for APPS_LAN_WAN_PROD.  The AP driver must not
+replace that pipe's filter pointer with a separately allocated table.
+
+Describe the same hardware ownership in the mainline device tree.  The
+ipa2-lite QMI path already honours this property: it accepts the modem's
+rules and enables filtering without installing or reapplying an AP-owned
+pipe-4 table.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+---
+ arch/arm64/boot/dts/qcom/sdm630.dtsi | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm630.dtsi b/arch/arm64/boot/dts/qcom/sdm630.dtsi
+index 564bbb0..b459390 100644
+--- a/arch/arm64/boot/dts/qcom/sdm630.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm630.dtsi
+@@ -1040,5 +1040,6 @@
+ 		ipa: ipa@14780000 {
+ 			compatible = "qcom,ipa-lite-v2.6";
++			qcom,modem-cfg-emb-pipe-flt;
+ 			reg = <0x14780000 0x47000>;
+ 			clocks = <&rpmcc RPM_SMD_IPA_CLK>;
+ 			interrupts = <GIC_SPI 333 IRQ_TYPE_EDGE_RISING>,
+-- 
+2.51.0

@@ -1,0 +1,35 @@
+From: 1DKT8H <szymonj159@gmail.com>
+Subject: [PATCH] net: ipa2-lite: match IPA 2.6L reset values used by SDM660
+
+SDM660 downstream enables the IPA component with COMP_CFG=0x11 and leaves
+BAM_CNFG_BITS untouched on IPA 2.6L.  Mirror those hardware initialization
+values before the modem starts its IPA QMI handshake.
+
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+index a49977808..57919000f 100644
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -587,7 +587,10 @@ static void ipa_reset_hw(struct ipa *ipa)
+ {
+ 	iowrite32(1, ipa->mmio + REG_IPA_COMP_SW_RESET_OFST);
+ 	iowrite32(0, ipa->mmio + REG_IPA_COMP_SW_RESET_OFST);
+-	iowrite32(1, ipa->mmio + REG_IPA_COMP_CFG_OFST);
++	if (ipa->version == 26)
++		iowrite32(0x11, ipa->mmio + REG_IPA_COMP_CFG_OFST);
++	else
++		iowrite32(1, ipa->mmio + REG_IPA_COMP_CFG_OFST);
+ 	if (ipa->version >= 25)
+ 		iowrite32(0x1fff7f, ipa->mmio + REG_IPA_BCR_OFST);
+ 
+@@ -595,7 +598,9 @@ static void ipa_reset_hw(struct ipa *ipa)
+ 	iowrite32(0, ipa->mmio + REG_BAM_CTRL);
+ 
+ 	iowrite32(0x10, ipa->mmio + REG_BAM_DESC_CNT_TRSHLD);
+-	iowrite32((u32)~BIT(11), ipa->mmio + REG_BAM_CNFG_BITS);
++	/* SDM660 downstream leaves BAM_CNFG_BITS to IPA 2.6L firmware. */
++	if (ipa->version < 25)
++		iowrite32(0xffffe004, ipa->mmio + REG_BAM_CNFG_BITS);
+ 	rmw32(ipa->mmio + REG_BAM_CTRL, BAM_EN, BAM_EN);
+ 
+ 	iowrite32(BAM_ERROR_EN | BAM_HRESP_ERR_EN, ipa->mmio + REG_BAM_IRQ_EN);
+

@@ -1,0 +1,153 @@
+From: 1DKT8H <szymonj159@gmail.com>
+Subject: [PATCH] net: ipa2-lite: reapply AP filters after Q6 data-call setup
+
+On SDM660 the modem programs its embedded pipe-4 filter pointer when a
+data call starts.  This happens after ipa2-lite has installed the AP-owned
+uplink tables and acknowledged the QMI INSTALL_FILTER_RULE request.  A live
+trace on
+lavender showed the AP IPv4 table pointer (0xff7a2000) being replaced with
+the modem-local pointer (0x4a1); subsequent packets therefore bypassed the
+table that ipa2-lite had just built.
+
+The pointer update is an IPA immediate command and can sleep, so it cannot
+be performed directly from ndo_start_xmit.  Stop the modem TX queue on its
+first packet, schedule a work item to reassert both AP-owned table
+pointers, then wake the queue.  Returning NETDEV_TX_BUSY keeps the original
+skb for retry and ensures no packet crosses the stale Q6 table during the
+update.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+---
+ drivers/net/ipa2-lite/ipa.c | 73 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 72 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+index 2c1190d..6e32e24 100644
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -129,6 +129,8 @@ struct ipa {
+ 	bool tx_irq_logged;
+ 	int dma_irq;
+ 	struct mutex filter_lock;
++	struct work_struct filter_reapply_work;
++	atomic_t filter_reapply_state;
+ };
+ 
+ struct ipa_ndev {
+@@ -592,6 +594,7 @@ int ipa_clear_modem_filters(struct device *dev)
+ 
+ 	ipa_filter_replace(ipa, 0, &empty);
+ 	ipa_filter_replace(ipa, 1, &empty);
++	atomic_set(&ipa->filter_reapply_state, 0);
+ 	dev_info(dev, "cleared modem uplink filters\n");
+ 
+ out_unlock:
+@@ -644,6 +647,12 @@ int ipa_install_modem_filters(struct device *dev,
+ 	if (ret)
+ 		goto out_free_v6;
+ 	ipa_filter_replace(ipa, 1, &v6);
++	/*
++	 * Q6 programs its embedded pipe-4 table when a data call starts.  That
++	 * happens after this QMI request and can replace both pointers above.
++	 * Reassert the AP-owned tables in process context on the first real TX.
++	 */
++	atomic_set(&ipa->filter_reapply_state, 1);
+ 
+ 	dev_info(dev, "installed %u modem uplink filters (%u IPv4, %u IPv6)\n",
+ 		 count, v4_count, v6_count);
+@@ -659,6 +668,51 @@ out_unlock:
+ 	return ret;
+ }
+ 
++static int ipa_filter_reapply(struct ipa *ipa)
++{
++	dma_addr_t v4_addr, v6_addr;
++	int ret;
++
++	mutex_lock(&ipa->filter_lock);
++	v4_addr = ipa->modem_filter[0].size ? ipa->modem_filter[0].addr :
++		  ipa->empty_rt.addr;
++	v6_addr = ipa->modem_filter[1].size ? ipa->modem_filter[1].addr :
++		  ipa->empty_rt.addr;
++
++	ret = ipa_filter_update_pointer(ipa, MEM_FT_V4, v4_addr);
++	if (!ret)
++		ret = ipa_filter_update_pointer(ipa, MEM_FT_V6, v6_addr);
++	mutex_unlock(&ipa->filter_lock);
++
++	return ret;
++}
++
++static void ipa_filter_reapply_work(struct work_struct *work)
++{
++	struct ipa *ipa = container_of(work, struct ipa, filter_reapply_work);
++	int ret;
++
++	ret = ipa_filter_reapply(ipa);
++	if (ret) {
++		atomic_set(&ipa->filter_reapply_state, 1);
++		dev_warn(ipa->dev, "failed to reapply modem filters: %d\n", ret);
++	} else {
++		atomic_set(&ipa->filter_reapply_state, 0);
++		dev_info(ipa->dev,
++			 "reapplied modem filters after Q6 data-call setup\n");
++	}
++
++	if (ipa->modem && netif_running(ipa->modem))
++		netif_wake_queue(ipa->modem);
++}
++
++static void ipa_cancel_filter_reapply(void *data)
++{
++	struct ipa *ipa = data;
++
++	cancel_work_sync(&ipa->filter_reapply_work);
++}
++
+ static void ipa_reset_hw(struct ipa *ipa)
+ {
+ 	iowrite32(1, ipa->mmio + REG_IPA_COMP_SW_RESET_OFST);
+@@ -1842,6 +1896,17 @@ static netdev_tx_t ipa_ndev_start_xmit(struct sk_buff *skb,
+ 	struct ipa *ipa = ipa_ndev->rx->ipa;
+ 	int ret;
+ 
++	if (ipa_ndev->tx && ipa_ndev->tx->id == EP_TX) {
++		ret = atomic_cmpxchg(&ipa->filter_reapply_state, 1, 2);
++		if (ret == 1) {
++			netif_stop_queue(ndev);
++			schedule_work(&ipa->filter_reapply_work);
++			return NETDEV_TX_BUSY;
++		}
++		if (ret == 2)
++			return NETDEV_TX_BUSY;
++	}
++
+ 	if (skb->protocol != htons(ETH_P_MAP) || skb_linearize(skb) || !ipa_ndev->tx)
+ 		goto drop_tx;
+ 
+@@ -2031,8 +2096,10 @@ static int ipa_probe(struct platform_device *pdev)
+ 		of_property_read_bool(dev->of_node, "qcom,modem-cfg-emb-pipe-flt");
+ 
+ 	atomic_set(&ipa->uc_cmd_busy, 0);
++	atomic_set(&ipa->filter_reapply_state, 0);
+ 	init_waitqueue_head(&ipa->uc_cmd_wq);
+ 	mutex_init(&ipa->filter_lock);
++	INIT_WORK(&ipa->filter_reapply_work, ipa_filter_reapply_work);
+ 	platform_set_drvdata(pdev, ipa);
+ 	for (ep = 0; ep < ARRAY_SIZE(ipa->modem_filter); ep++) {
+ 		ret = devm_add_action_or_reset(dev, action_ipa_dma_free,
+@@ -2191,7 +2258,11 @@ static int ipa_probe(struct platform_device *pdev)
+ 		ipa_qmi_uc_loaded(ipa->qmi);
+ 	}
+ 
+-	return devm_add_action_or_reset(dev, action_ipa_qmi_teardown, ipa);
++	ret = devm_add_action_or_reset(dev, action_ipa_qmi_teardown, ipa);
++	if (ret)
++		return ret;
++
++	return devm_add_action_or_reset(dev, ipa_cancel_filter_reapply, ipa);
+ }
+ 
+ static void ipa_remove(struct platform_device *pdev)
+-- 
+2.51.0

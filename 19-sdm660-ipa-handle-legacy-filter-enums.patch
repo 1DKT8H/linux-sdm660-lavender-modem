@@ -1,0 +1,128 @@
+From: 1DKT8H <szymonj159@gmail.com>
+Subject: [PATCH] net: ipa2-lite: handle legacy IPA v2 filter enums
+
+The SDM660 modem firmware used by lavender sends the older zero-based
+INSTALL_FILTER_RULE representation: IPv4 is 0, IPv6 is 1, and routing is
+action 0.  The later public IPA QMI IDL reserves zero for INVALID and moves
+those values to 1, 2, and 3 respectively.
+
+The mismatch made the AP-side fallback added for modem-owned embedded
+filters reject all 24 rules.  It also constructed FILTER_INSTALLED indices
+with the IPv4 and IPv6 groups reversed.  Detect the legacy representation
+from the unambiguous presence of IP type zero, use the matching family base
+for both hardware tables and the QMI acknowledgment, and accept the legacy
+routing action.  Keep accepting the newer IDL values as well.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+
+diff --git a/drivers/net/ipa2-lite/ipa.h b/drivers/net/ipa2-lite/ipa.h
+index 7a0f80f..9d3d2ea 100644
+--- a/drivers/net/ipa2-lite/ipa.h
++++ b/drivers/net/ipa2-lite/ipa.h
+@@ -105,6 +105,23 @@ struct ipa_qmi_filter_rule {
+ 	u32 mux_id;
+ };
+ 
++/*
++ * Older IPA v2 modem firmware numbers IP families from zero, while the
++ * later public QMI IDL reserves zero for INVALID.  A request containing
++ * type zero unambiguously identifies the older ABI.
++ */
++static inline u32
++ipa_qmi_filter_ip_base(const struct ipa_qmi_filter_rule *rules, u8 count)
++{
++	u8 i;
++
++	for (i = 0; i < count; i++)
++		if (!rules[i].ip_type)
++			return 0;
++
++	return 1;
++}
++
+ struct device;
+ struct ipa_qmi;
+ 
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+index d1a31fe..48d75f9 100644
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -435,6 +435,9 @@ static int ipa_filter_emit_rule(const struct ipa_qmi_filter_rule *rule,
+ 	int ret;
+ 
+ 	switch (rule->action) {
++	case 0: /* Legacy IPA v2 QMI: IPA_PASS_TO_ROUTING */
++		action = 0;
++		break;
+ 	case 1: /* QMI_IPA_FILTER_ACTION_SRC_NAT */
+ 		action = 1; /* IPA_PASS_TO_SRC_NAT */
+ 		break;
+@@ -610,6 +613,7 @@ int ipa_install_modem_filters(struct device *dev,
+ 	struct ipa *ipa = dev_get_drvdata(dev);
+ 	struct ipa_dma_obj v4 = { }, v6 = { };
+ 	u8 v4_count = 0, v6_count = 0;
++	u32 ip_base;
+ 	int ret;
+ 
+ 	if (!ipa || ipa->version != 26 || !ipa->empty_rt.size)
+@@ -619,8 +623,10 @@ int ipa_install_modem_filters(struct device *dev,
+ 		return -EINVAL;
+ 	if (!count)
+ 		return ipa_clear_modem_filters(dev);
++	ip_base = ipa_qmi_filter_ip_base(rules, count);
+ 	for (ret = 0; ret < count; ret++) {
+-		if (rules[ret].ip_type == 1 || rules[ret].ip_type == 2)
++		if (rules[ret].ip_type == ip_base ||
++		    rules[ret].ip_type == ip_base + 1)
+ 			continue;
+ 		dev_warn(dev,
+ 			 "skipping modem filter %d with unsupported IP type %u (id=%#x)\n",
+@@ -628,10 +634,11 @@ int ipa_install_modem_filters(struct device *dev,
+ 	}
+ 
+ 	mutex_lock(&ipa->filter_lock);
+-	ret = ipa_filter_build(ipa, rules, count, 1, &v4, &v4_count);
++	ret = ipa_filter_build(ipa, rules, count, ip_base, &v4, &v4_count);
+ 	if (ret)
+ 		goto out_unlock;
+-	ret = ipa_filter_build(ipa, rules, count, 2, &v6, &v6_count);
++	ret = ipa_filter_build(ipa, rules, count, ip_base + 1,
++			       &v6, &v6_count);
+ 	if (ret)
+ 		goto out_free_v4;
+ 
+diff --git a/drivers/net/ipa2-lite/ipa-qmi.c b/drivers/net/ipa2-lite/ipa-qmi.c
+index 2bd9a61..54d20fb 100644
+--- a/drivers/net/ipa2-lite/ipa-qmi.c
++++ b/drivers/net/ipa2-lite/ipa-qmi.c
+@@ -1752,6 +1752,7 @@ static int ipa_qmi_notify_filter_installed(struct ipa_qmi *ipa_qmi)
+ 	struct qmi_handle *qmi = &ipa_qmi->client_handle;
+ 	struct qmi_txn txn;
+ 	u8 i, v4_index = 0, v6_index = 0;
++	u32 ip_base;
+ 	int ret;
+ 
+ 	if (!ipa_qmi->modem_ready)
+@@ -1761,20 +1762,13 @@ static int ipa_qmi_notify_filter_installed(struct ipa_qmi *ipa_qmi)
+ 	req.source_pipe_index = ipa_qmi->filter_source_pipe;
+ 	req.install_status = QMI_RESULT_SUCCESS_V01;
+ 	req.handles_len = ipa_qmi->filter_rules_count;
++	ip_base = ipa_qmi_filter_ip_base(ipa_qmi->filter_rules, req.handles_len);
+ 	for (i = 0; i < req.handles_len; i++) {
+ 		req.handles[i].handle = 69 + i; /* UL_FILTER_RULE_HANDLE_START */
+-		switch (ipa_qmi->filter_rules[i].ip_type) {
+-		case 1: /* QMI_IPA_IP_TYPE_V4 */
++		if (ipa_qmi->filter_rules[i].ip_type == ip_base)
+ 			req.handles[i].index = v4_index++;
+-			break;
+-		case 2: /* QMI_IPA_IP_TYPE_V6 */
++		else
+ 			req.handles[i].index = v6_index++;
+-			break;
+-		default:
+-			/* Downstream accounts IPA_IP_MAX entries in the v6 index. */
+-			req.handles[i].index = v6_index++;
+-			break;
+-		}
+ 	}
+ 

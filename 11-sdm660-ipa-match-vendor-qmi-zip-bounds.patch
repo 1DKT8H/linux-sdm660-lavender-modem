@@ -1,0 +1,91 @@
+From 5e1c0b04f34cdb1721ff695ca2af8cfd91c24865 Mon Sep 17 00:00:00 2001
+From: 1DKT8H <szymonj159@gmail.com>
+Date: Tue, 1 Sep 2026 12:30:00 +0200
+Subject: [PATCH] net: ipa2-lite: match vendor v2.6L QMI ZIP bounds
+
+The SDM660 modem firmware expects the IPA INIT_DRIVER ZIP bounds in the
+same form used by Qualcomm's downstream ipa_v2 and ipa_v3 drivers.  The
+start value is the compression/decompression partition size plus the
+restricted SRAM prefix, while the end value remains partition offset plus
+size minus one.
+
+This looks unusual, but it is repeated in Qualcomm's downstream drivers.
+Sending the conventional partition offset here differs from the working
+SDM660 Android stack and leaves the modem using a different IPA SRAM
+layout.  Pass the restricted prefix into the QMI layer and reproduce the
+vendor ABI exactly.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+---
+ drivers/net/ipa2-lite/ipa-qmi.c | 10 +++++++---
+ drivers/net/ipa2-lite/ipa.c     |  2 +-
+ drivers/net/ipa2-lite/ipa.h     |  3 ++-
+ 3 files changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ipa2-lite/ipa-qmi.c b/drivers/net/ipa2-lite/ipa-qmi.c
+--- a/drivers/net/ipa2-lite/ipa-qmi.c
++++ b/drivers/net/ipa2-lite/ipa-qmi.c
+@@ -1348,6 +1348,7 @@ static const struct qmi_elem_info ipa_init_modem_driver_rsp_ei[] = {
+ struct ipa_qmi {
+ 	struct device *dev;
+ 	const struct ipa_partition *mem_layout;
++	u16 smem_restr_bytes;
+ 	struct qmi_handle client_handle;
+ 	struct qmi_handle server_handle;
+ 
+@@ -1836,7 +1837,9 @@ init_modem_driver_req(struct ipa_qmi *ipa_qmi, struct ipa_init_modem_driver_req
+ 	req->modem_mem_info.size = mem[MEM_MDM].size;
+ 	req->modem_mem_info_valid = !!mem[MEM_MDM].size;
+ 
+-	req->zip_tbl_info.start = mem[MEM_MDM_COMP].offset;
++	/* Qualcomm's v2.6L QMI ABI uses size, not offset, for ZIP start. */
++	req->zip_tbl_info.start = ipa_qmi->smem_restr_bytes +
++				      mem[MEM_MDM_COMP].size;
+ 	req->zip_tbl_info.end = mem[MEM_MDM_COMP].offset + mem[MEM_MDM_COMP].size - 1;
+ 	req->zip_tbl_info_valid = !!mem[MEM_MDM_COMP].size;
+ 
+@@ -1927,7 +1930,8 @@ static const struct qmi_ops ipa_client_ops = {
+ };
+ 
+ /* Set up for QMI message exchange */
+-struct ipa_qmi *ipa_qmi_setup(struct device *dev, const struct ipa_partition *layout)
++struct ipa_qmi *ipa_qmi_setup(struct device *dev,
++		const struct ipa_partition *layout, u16 smem_restr_bytes)
+ {
+ 	struct ipa_qmi *ipa_qmi;
+ 	int ret;
+@@ -1939,6 +1943,7 @@ struct ipa_qmi *ipa_qmi_setup(struct device *dev, const struct ipa_partition *la
+ 	ipa_qmi->dev = dev;
+ 	ipa_qmi->initial_boot = true;
+ 	ipa_qmi->mem_layout = layout;
++	ipa_qmi->smem_restr_bytes = smem_restr_bytes;
+ 	mutex_init(&ipa_qmi->filter_lock);
+ 
+ 	/* The server handle is used to handle the DRIVER_INIT_COMPLETE
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -1964,7 +1964,7 @@ static int ipa_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
+-	ipa->qmi = ipa_qmi_setup(dev, ipa->layout);
++	ipa->qmi = ipa_qmi_setup(dev, ipa->layout, ipa->smem_restr_bytes);
+ 	if (IS_ERR(ipa->qmi))
+ 		return PTR_ERR(ipa->qmi);
+ 
+diff --git a/drivers/net/ipa2-lite/ipa.h b/drivers/net/ipa2-lite/ipa.h
+--- a/drivers/net/ipa2-lite/ipa.h
++++ b/drivers/net/ipa2-lite/ipa.h
+@@ -107,7 +107,8 @@ struct ipa_qmi_filter_rule {
+ struct device;
+ struct ipa_qmi;
+ 
+-struct ipa_qmi *ipa_qmi_setup(struct device *dev, const struct ipa_partition *layout);
++struct ipa_qmi *ipa_qmi_setup(struct device *dev,
++		const struct ipa_partition *layout, u16 smem_restr_bytes);
+ bool ipa_qmi_is_modem_ready(struct ipa_qmi *ipa_qmi);
+ void ipa_qmi_uc_loaded(struct ipa_qmi *ipa_qmi);
+ void ipa_qmi_teardown(struct ipa_qmi *ipa_qmi);
+-- 
+2.51.0

@@ -1,0 +1,138 @@
+From 6a1d52e96103408883e0771b6a8e4d7934c903f1 Mon Sep 17 00:00:00 2001
+From: 1DKT8H <szymonj159@gmail.com>
+Date: Sun, 30 Aug 2026 20:48:00 +0200
+Subject: [PATCH] net: ipa2-lite: handle the uC event interrupt
+
+The SDM660 downstream driver registers handlers for both microcontroller
+interrupts: UC_IRQ_0 carries events and errors, while UC_IRQ_1 carries
+responses.  ipa2-lite enabled only UC_IRQ_1.  This leaves an event raised by
+the first modem data packet pending and invisible to the AP driver.
+
+Enable and acknowledge both interrupts, report the uC event SRAM payload,
+and clear any other disabled pending conditions as the upstream IPA IRQ
+handler does.  Log the AP IRQ state immediately before the first modem TX so
+that a remaining modem firmware failure has enough context to identify the
+asserted bit.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+---
+ drivers/net/ipa2-lite/ipa.c | 70 ++++++++++++++++++++++++++++++---------------
+ 1 file changed, 47 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+index 0a259c921402..fa29bfc9a30a 100644
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -125,6 +125,7 @@ struct ipa {
+ 	struct ipa_dma_obj modem_filter[2], modem_filter_prev[2];
+ 	struct icc_bulk_data interconnect[IPA_INTERCONNECT_COUNT];
+ 	bool modem_cfg_emb_pipe_flt;
++	bool tx_irq_logged;
+ 	struct mutex filter_lock;
+ };
+ 
+@@ -1270,27 +1271,52 @@ static irqreturn_t ipa_isr_thread(int irq, void *data)
+ {
+ 	struct ipa *ipa = data;
+-	u32 enabled, pending, val;
++	u32 enabled, event, event_param, mask, pending, val;
+ 
+ 	enabled = ioread32(ipa->mmio + REG_IPA_IRQ_EN_EE0);
+-	pending = ioread32(ipa->mmio + REG_IPA_IRQ_STTS_EE0);
+-	pending &= enabled;
++	for (;;) {
++		pending = ioread32(ipa->mmio + REG_IPA_IRQ_STTS_EE0);
++		mask = pending & enabled;
++		if (!mask)
++			break;
+ 
+-	if (pending & BIT(IPA_IRQ_UC_IRQ_1)) {
+-		/* uC response data must be consumed after clearing its IRQ. */
+-		iowrite32(BIT(IPA_IRQ_UC_IRQ_1),
+-			  ipa->mmio + REG_IPA_IRQ_CLR_EE0);
+-		val = ioread32(ipa->mmio + REG_IPA_UC_RESP);
+-		val &= IPA_UC_RESP_OP_MASK;
+-		if (val == IPA_UC_RESPONSE_INIT_COMPLETED) {
+-			ipa->uc_loaded = true;
+-			if (ipa->qmi)
+-				ipa_qmi_uc_loaded(ipa->qmi);
+-			if (ipa->version != 26)
+-				ipa->smem_uc_loaded[0] = 0x10ADEDFF;
+-		} else if (ipa->qmi && val == IPA_UC_RESPONSE_CMD_COMPLETED) {
+-			wake_up_all(&ipa->uc_cmd_wq);
++		if (mask & BIT(IPA_IRQ_UC_IRQ_0)) {
++			/* Downstream clears uC IRQs before consuming their SRAM. */
++			iowrite32(BIT(IPA_IRQ_UC_IRQ_0),
++				  ipa->mmio + REG_IPA_IRQ_CLR_EE0);
++			event = ioread32(ipa->mmio + REG_IPA_UC_EVENT);
++			event_param = ioread32(ipa->mmio + REG_IPA_UC_EVENT_PARAM);
++			dev_err(ipa->dev,
++				"uC event: opcode=%#x params=%#x irq_status=%#x\n",
++				event, event_param, pending);
+ 		}
++
++		if (mask & BIT(IPA_IRQ_UC_IRQ_1)) {
++			/* uC response data must be consumed after clearing its IRQ. */
++			iowrite32(BIT(IPA_IRQ_UC_IRQ_1),
++				  ipa->mmio + REG_IPA_IRQ_CLR_EE0);
++			val = ioread32(ipa->mmio + REG_IPA_UC_RESP);
++			val &= IPA_UC_RESP_OP_MASK;
++			if (val == IPA_UC_RESPONSE_INIT_COMPLETED) {
++				ipa->uc_loaded = true;
++				if (ipa->qmi)
++					ipa_qmi_uc_loaded(ipa->qmi);
++				if (ipa->version != 26)
++					ipa->smem_uc_loaded[0] = 0x10ADEDFF;
++			} else if (ipa->qmi &&
++				   val == IPA_UC_RESPONSE_CMD_COMPLETED) {
++				wake_up_all(&ipa->uc_cmd_wq);
++			}
++		}
++	}
++
++	/* Status includes disabled conditions; don't leave stale bits latched. */
++	pending = ioread32(ipa->mmio + REG_IPA_IRQ_STTS_EE0);
++	if (pending) {
++		dev_warn_ratelimited(ipa->dev,
++				     "clearing disabled IPA interrupts %#x (enabled %#x)\n",
++				     pending, enabled);
++		iowrite32(pending, ipa->mmio + REG_IPA_IRQ_CLR_EE0);
+ 	}
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -1627,11 +1653,21 @@ static netdev_tx_t ipa_ndev_start_xmit(struct sk_buff *skb,
+ 				       struct net_device *ndev)
+ {
+ 	struct ipa_ndev *ipa_ndev = netdev_priv(ndev);
++	struct ipa *ipa = ipa_ndev->rx->ipa;
+ 	int ret;
+ 
+ 	if (skb->protocol != htons(ETH_P_MAP) || skb_linearize(skb) || !ipa_ndev->tx)
+ 		goto drop_tx;
+ 
++	if (!ipa->tx_irq_logged) {
++		ipa->tx_irq_logged = true;
++		dev_info(ipa->dev,
++			 "first modem TX: len=%u irq_status=%#x irq_enabled=%#x\n",
++			 skb->len,
++			 ioread32(ipa->mmio + REG_IPA_IRQ_STTS_EE0),
++			 ioread32(ipa->mmio + REG_IPA_IRQ_EN_EE0));
++	}
++
+ 	ret = ipa_enqueue_skb(skb, ndev, ipa_ndev->tx);
+ 	if (ret == -EBUSY)
+ 		return NETDEV_TX_BUSY;
+@@ -1868,7 +1904,9 @@ static int ipa_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
+-	rmw32(ipa->mmio + REG_IPA_IRQ_EN_EE0, BIT(IPA_IRQ_UC_IRQ_1), BIT(IPA_IRQ_UC_IRQ_1));
++	/* Downstream registers both the uC event and response interrupts. */
++	iowrite32(BIT(IPA_IRQ_UC_IRQ_0) | BIT(IPA_IRQ_UC_IRQ_1),
++		  ipa->mmio + REG_IPA_IRQ_EN_EE0);
+ 
+ 	ret = of_irq_get_byname(dev->of_node, "ipa");
+ 	if (ret < 0)
+-- 
+2.51.0

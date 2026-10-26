@@ -1,0 +1,205 @@
+From: 1DKT8H <szymonj159@gmail.com>
+Subject: [PATCH] net: ipa2-lite: fix netdev cleanup lifetime and preserve failure state
+
+The archived r44 panic shows NAPI deletion while enabled followed by an
+invalid skb pointer in ndo_stop during devres unwind. Allocate skb arrays
+before registering netdev cleanup, unregister before deleting NAPI, and
+exclude the shared BAM IRQ while removing its NAPI pointers. Match the
+coherent allocation/free sizes, handle runtime resume failures and return
+a defined error on RX allocation/DMA mapping failure.
+
+Preserve AP-owned IRQ and FIFO state before modem recovery; log BAM errors
+before acknowledging them. This does not claim to fix the firmware's
+ipa_hal.c:2163 assertion on the first data packet.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+index c46d863..87443e1 100644
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -127,6 +127,7 @@ struct ipa {
+ 	struct icc_bulk_data interconnect[IPA_INTERCONNECT_COUNT];
+ 	bool modem_cfg_emb_pipe_flt;
+ 	bool tx_irq_logged;
++	int dma_irq;
+ 	struct mutex filter_lock;
+ };
+ 
+@@ -143,6 +144,7 @@ static int ipa_submit_sync(struct ipa_ep *ep, struct fifo_desc *descs,
+ static void ipa_setup_cmd_desc(struct fifo_desc *desc,
+ 			       enum ipa_cmd_opcode opcode,
+ 			       struct ipa_dma_obj *cmd_args_obj, void *cmd_args_ptr);
++static void ipa_dump_first_tx_state(struct ipa *ipa);
+ 
+ #define FT4_EP0_OFF (2 + 3 * 0)
+ #define FT4_EP4_OFF (2 + 3 * 1)
+@@ -187,7 +189,7 @@ static int ipa_dma_alloc(struct ipa *ipa, struct ipa_dma_obj *obj, u32 size)
+ 	if (WARN_ON(!size))
+ 		return -EINVAL;
+ 
+-	obj->virt = dma_alloc_coherent(ipa->dev, size + 8, &obj->addr, GFP_KERNEL);
++	obj->virt = dma_alloc_coherent(ipa->dev, size, &obj->addr, GFP_KERNEL);
+ 	if (!obj->virt)
+ 		return -ENOMEM;
+ 
+@@ -748,6 +750,16 @@ static int ipa_setup_ep(struct ipa *ipa, enum ipa_ep_id id)
+ 	ep->reg_rd_off = ipa->mmio + REG_BAM_P_RD_OFF_REG(id);
+ 	ep->reg_wr_off = ipa->mmio + REG_BAM_P_WR_OFF_REG(id);
+ 
++	/* Allocate before registering netdev cleanup: devres unwinds in reverse.
++	 * ndo_stop must still own this array while draining mapped packets.
++	 */
++	if (id != EP_CMD) {
++		ep->skbs = devm_kcalloc(ipa->dev, IPA_FIFO_NUM_DESC,
++				       sizeof(*ep->skbs), GFP_KERNEL);
++		if (!ep->skbs)
++			return -ENOMEM;
++	}
++
+ 	ipa_bam_reset_pipe(ep);
+ 
+ 	rmw32(ipa->mmio + REG_BAM_IRQ_SRCS_MSK_EE0, BIT(id), BIT(id));
+@@ -806,7 +818,7 @@ static inline void ipa_release_descs(struct ipa_ep *ep, int reserved)
+ 
+ static inline int ipa_reserve_descs(struct ipa_ep *ep, int count)
+ {
+-	if (unlikely(count <= 0 && atomic_read(&ep->free_descs) < count))
++	if (unlikely(count <= 0 || atomic_read(&ep->free_descs) < count))
+ 		return 0;
+ 
+ 	if (atomic_sub_return(count, &ep->free_descs) < 0)
+@@ -1256,6 +1268,7 @@ static void ipa_reset_flush_ep(struct ipa_ep *ep)
+ 			dev_kfree_skb_any(skb);
+ 
+ 		ep->fifo[head].addr = 0;
++		ep->skbs[head] = NULL;
+ 		head = IPA_FIFO_NEXT_IDX(head);
+ 	}
+ }
+@@ -1266,6 +1279,11 @@ static int ipa_ssr_notifier(struct notifier_block *nb,
+ 	struct ipa *ipa = container_of(nb, struct ipa, ssr_nb);
+ 
+ 	if (action == QCOM_SSR_BEFORE_SHUTDOWN) {
++		/* Preserve AP-side state before uC recovery resets the evidence.
++		 * Do not acknowledge errors or touch Q6/uC-owned EE banks here.
++		 */
++		dev_info(ipa->dev, "modem SSR: AP state before recovery\n");
++		ipa_dump_first_tx_state(ipa);
+ 		ipa_modem_set_present(ipa->dev, false);
+ 	} else if (action == QCOM_SSR_AFTER_SHUTDOWN) {
+ 		if (!ipa_reset_modem_pipes(ipa))
+@@ -1346,6 +1364,10 @@ static irqreturn_t ipa_dma_isr(int irq, void *data)
+ 	if (srcs & BIT(31)) {
+ 		u32 sts = ioread32(ipa->mmio + REG_BAM_IRQ_STTS);
+ 
++		if (sts & (BAM_ERROR_EN | BAM_HRESP_ERR_EN))
++			dev_err_ratelimited(ipa->dev,
++					    "BAM global error: status=%#x sources=%#x\n",
++					    sts, srcs);
+ 		iowrite32(sts, ipa->mmio + REG_BAM_IRQ_CLR);
+ 		srcs &= ~BIT(31);
+ 	}
+@@ -1584,7 +1606,7 @@ static int ipa_enqueue_skb(struct sk_buff *skb, struct net_device *ndev, struct
+ {
+ 	struct device *dev = ep->ipa->dev;
+ 	struct fifo_desc desc;
+-	int ret, reserved;
++	int ret = -ENOMEM, reserved;
+ 	u32 len;
+ 
+ 	len = ep->is_rx ? IPA_RX_LEN : skb->len;
+@@ -1655,24 +1677,9 @@ static int ipa_ndev_open(struct net_device *ndev)
+ 		}
+ 	}
+ 
+-	if (!ipa_ndev->rx->skbs) {
+-		ipa_ndev->rx->skbs = devm_kzalloc(ipa->dev,
+-				sizeof(struct sk_buff) * IPA_FIFO_NUM_DESC,
+-				GFP_KERNEL);
+-		if (!ipa_ndev->rx->skbs)
+-			return -ENOMEM;
+-	}
+-
+-	if (ipa_ndev->tx && !ipa_ndev->tx->skbs) {
+-		ipa_ndev->tx->skbs = devm_kzalloc(ipa->dev,
+-				sizeof(struct sk_buff) * IPA_FIFO_NUM_DESC,
+-				GFP_KERNEL);
+-
+-		if (!ipa_ndev->tx->skbs)
+-			return -ENOMEM;
+-	}
+-
+-	pm_runtime_get_sync(ipa->dev);
++	ret = pm_runtime_resume_and_get(ipa->dev);
++	if (ret < 0)
++		return ret;
+ 
+ 	while (atomic_read(&ipa_ndev->rx->free_descs) > 0) {
+ 		ret = ipa_enqueue_skb(NULL, ndev, ipa_ndev->rx);
+@@ -1763,13 +1770,15 @@ static void ipa_ndev_suspend_resume(struct net_device *ndev, bool resume)
+ 
+ static void ipa_dump_first_tx_state(struct ipa *ipa)
+ {
+-	/* AP owns EE0; touching Q6/uC EE banks from AP is not supported. */
+-	dev_info(ipa->dev, "first TX EE0: status=%#x enabled=%#x\n",
++	int id;
++
++	/* Limit diagnostics to the AP's EE0 and AP system pipes. */
++	dev_info(ipa->dev, "AP EE0: status=%#x enabled=%#x\n",
+ 		 ioread32(ipa->mmio + REG_IPA_IRQ_STTS_EE0),
+ 		 ioread32(ipa->mmio + REG_IPA_IRQ_EN_EE0));
+ 
+ 	dev_info(ipa->dev,
+-		 "first TX pipes: p2 ctrl=%#x irq=%#x status=%#x; p4 ctrl=%#x irq=%#x status=%#x; p5 ctrl=%#x irq=%#x status=%#x\n",
++		 "AP pipes: p2 ctrl=%#x irq=%#x status=%#x; p4 ctrl=%#x irq=%#x status=%#x; p5 ctrl=%#x irq=%#x status=%#x\n",
+ 		 ioread32(ipa->mmio + REG_BAM_P_CTRL(EP_LAN_RX)),
+ 		 ioread32(ipa->mmio + REG_BAM_P_IRQ_EN(EP_LAN_RX)),
+ 		 ioread32(ipa->mmio + REG_IPA_EP_STATUS(EP_LAN_RX)),
+@@ -1779,6 +1788,15 @@ static void ipa_dump_first_tx_state(struct ipa *ipa)
+ 		 ioread32(ipa->mmio + REG_BAM_P_CTRL(EP_RX)),
+ 		 ioread32(ipa->mmio + REG_BAM_P_IRQ_EN(EP_RX)),
+ 		 ioread32(ipa->mmio + REG_IPA_EP_STATUS(EP_RX)));
++	for (id = EP_LAN_RX; id <= EP_RX; id++) {
++		struct ipa_ep *ep = &ipa->ep[id];
++
++		dev_info(ipa->dev,
++			 "AP pipe %d: hw_rd=%#x hw_wr=%#x head=%u tail=%u irq_sts=%#x\n",
++			 id, ioread32(ep->reg_rd_off), ioread32(ep->reg_wr_off),
++			 READ_ONCE(ep->head), READ_ONCE(ep->tail),
++			 ioread32(ipa->mmio + REG_BAM_P_IRQ_STTS(id)));
++	}
+ }
+ 
+ static netdev_tx_t ipa_ndev_start_xmit(struct sk_buff *skb,
+@@ -1846,11 +1864,20 @@ static void ipa_remove_netdev(void *data)
+ {
+ 	struct net_device *ndev = data;
+ 	struct ipa_ndev *ipa_ndev = netdev_priv(ndev);
++	struct ipa *ipa = ipa_ndev->rx->ipa;
++
++	/* unregister invokes ndo_stop: NAPI and packet arrays must be alive. */
++	unregister_netdev(ndev);
+ 
++	/* The shared BAM IRQ can still run for another endpoint. */
++	disable_irq(ipa->dma_irq);
+ 	netif_napi_del(ipa_ndev->rx->napi);
+-	if (ipa_ndev->tx)
++	ipa_ndev->rx->napi = NULL;
++	if (ipa_ndev->tx) {
+ 		netif_napi_del(ipa_ndev->tx->napi);
+-	unregister_netdev(ndev);
++		ipa_ndev->tx->napi = NULL;
++	}
++	enable_irq(ipa->dma_irq);
+ 	free_netdev(ndev);
+ }
+ 
+@@ -2058,6 +2085,7 @@ static int ipa_probe(struct platform_device *pdev)
+ 	ret = of_irq_get_byname(dev->of_node, "dma");
+ 	if (ret < 0)
+ 		return ret;
++	ipa->dma_irq = ret;
+ 
+ 	ret = devm_request_irq(dev, ret, ipa_dma_isr, 0, "ipa-dma", ipa);
+ 	if (ret)

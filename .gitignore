@@ -1,0 +1,12 @@
+# Build artifacts
+*.apk
+*.tar.gz
+src/
+pkg/
+
+# Temporary / editor files
+*~
+*.swp
+*.swo
+.idea/
+.vscode/

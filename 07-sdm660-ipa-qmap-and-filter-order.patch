@@ -1,0 +1,165 @@
+From 5c4e9e95415ea5a4d9a0a6f65cb175cc0f68e5af Mon Sep 17 00:00:00 2001
+From: 1DKT8H <szymonj159@gmail.com>
+Date: Sun, 30 Aug 2026 20:20:00 +0200
+Subject: [PATCH] net: ipa2-lite: match SDM660 rmnet endpoint setup
+
+The downstream IPA v2.6L driver encodes a big-endian QMAP header by setting
+HDR_ENDIANNESS.  ipa2-lite had this right originally, but the partial data
+port cleared the bit for the real modem endpoints.  This lets BAM complete
+transfers while IPA parses the QMAP length and packet metadata incorrectly.
+
+Also match downstream by disabling status generation on
+APPS_LAN_WAN_PROD and by leaving the global filter block disabled until the
+modem filter request has been accepted.  Android performs the equivalent
+filter enable from IPA_IOC_SET_FLT after IPACM has handled the rules.
+
+Finally, acknowledge the uC interrupt before consuming IPA_UC_RESP and only
+act on enabled pending interrupts, as required by the downstream interrupt
+handler.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+---
+ drivers/net/ipa2-lite/ipa-qmi.c |  9 +++++++--
+ drivers/net/ipa2-lite/ipa.c     | 47 ++++++++++++++++++++++------------------
+ drivers/net/ipa2-lite/ipa.h     |  3 ++-
+ 3 files changed, 35 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/net/ipa2-lite/ipa.h b/drivers/net/ipa2-lite/ipa.h
+index 978227ce46d9..48b58e0caa55 100644
+--- a/drivers/net/ipa2-lite/ipa.h
++++ b/drivers/net/ipa2-lite/ipa.h
+@@ -112,7 +112,8 @@ bool ipa_qmi_is_modem_ready(struct ipa_qmi *ipa_qmi);
+ void ipa_qmi_uc_loaded(struct ipa_qmi *ipa_qmi);
+ void ipa_qmi_teardown(struct ipa_qmi *ipa_qmi);
+ int ipa_qmi_apply_modem_filters(struct ipa_qmi *ipa_qmi,
+-				bool modem_cfg_emb_pipe_flt);
++				bool modem_cfg_emb_pipe_flt,
++				bool *filters_ready);
+ void ipa_modem_set_present(struct device *dev, bool present);
+ int ipa_install_modem_filters(struct device *dev,
+ 			      const struct ipa_qmi_filter_rule *rules, u8 count);
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+index 2fe35d41d5a3..0a259c921402 100644
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -659,8 +659,8 @@ static void ipa_reset_hw(struct ipa *ipa)
+ 	if (ipa->version >= 25)
+ 		iowrite32(0x1fff7f, ipa->mmio + REG_IPA_BCR_OFST);
+ 
+-	/* Downstream enables the filter block before programming rules. */
+-	iowrite32(1, ipa->mmio + REG_IPA_FILTER_OFST);
++	/* Enable filtering only after the modem's rules have been accepted. */
++	iowrite32(0, ipa->mmio + REG_IPA_FILTER_OFST);
+ 
+ 	iowrite32(BAM_SW_RST, ipa->mmio + REG_BAM_CTRL);
+ 	iowrite32(0, ipa->mmio + REG_BAM_CTRL);
+@@ -760,19 +760,18 @@ static int ipa_setup_ep(struct ipa *ipa, enum ipa_ep_id id)
+ 	case EP_TX:
+ 	case EP_TEST_TX:
+ 		iowrite32(ipa->test_mode ? 0xc4 : 0x44, ipa->mmio + REG_IPA_EP_HDR(id));
+-		/* QMAP is big-endian; downstream leaves HDR_ENDIANNESS clear. */
+-		iowrite32(ipa->test_mode ? 0x00000001 : 0x00000000,
+-			  ipa->mmio + REG_IPA_EP_HDR_EXT(id));
+-		iowrite32(0x00000005, ipa->mmio + REG_IPA_EP_STATUS(id));
++		/* Downstream encodes big-endian QMAP as HDR_ENDIANNESS = 1. */
++		iowrite32(0x00000001, ipa->mmio + REG_IPA_EP_HDR_EXT(id));
++		/* APPS_LAN_WAN_PROD does not generate IPA status indications. */
++		iowrite32(0x00000000, ipa->mmio + REG_IPA_EP_STATUS(id));
+ 		iowrite32(0x00000007, ipa->mmio + REG_IPA_EP_ROUTE(id));
+ 		iowrite32(0x00000020, ipa->mmio + REG_IPA_EP_MODE(id));
+ 		break;
+ 	case EP_RX:
+ 	case EP_TEST_RX:
+ 		iowrite32(0x002800c4, ipa->mmio + REG_IPA_EP_HDR(id));
+-		/* total-length valid + payload padding, with big-endian QMAP. */
+-		iowrite32(ipa->test_mode ? 0x0000000b : 0x0000000a,
+-			  ipa->mmio + REG_IPA_EP_HDR_EXT(id));
++		/* Total-length valid, payload padding and big-endian QMAP. */
++		iowrite32(0x0000000b, ipa->mmio + REG_IPA_EP_HDR_EXT(id));
+ 		iowrite32(0xff000000, ipa->mmio + REG_IPA_EP_HDR_METADATA_MASK(id));
+ 	default:
+ 		break;
+@@ -1271,11 +1270,15 @@ static irqreturn_t ipa_isr_thread(int irq, void *data)
+ {
+ 	struct ipa *ipa = data;
+-	u32 val;
++	u32 enabled, pending, val;
+ 
+-	val = ioread32(ipa->mmio + REG_IPA_IRQ_STTS_EE0);
+-	iowrite32(val, ipa->mmio + REG_IPA_IRQ_CLR_EE0);
++	enabled = ioread32(ipa->mmio + REG_IPA_IRQ_EN_EE0);
++	pending = ioread32(ipa->mmio + REG_IPA_IRQ_STTS_EE0);
++	pending &= enabled;
+ 
+-	if (val & BIT(IPA_IRQ_UC_IRQ_1)) {
++	if (pending & BIT(IPA_IRQ_UC_IRQ_1)) {
++		/* uC response data must be consumed after clearing its IRQ. */
++		iowrite32(BIT(IPA_IRQ_UC_IRQ_1),
++			  ipa->mmio + REG_IPA_IRQ_CLR_EE0);
+ 		val = ioread32(ipa->mmio + REG_IPA_UC_RESP);
+ 		val &= IPA_UC_RESP_OP_MASK;
+ 		if (val == IPA_UC_RESPONSE_INIT_COMPLETED) {
+@@ -1519,6 +1522,7 @@ static int ipa_ndev_open(struct net_device *ndev)
+ {
+ 	struct ipa_ndev *ipa_ndev = netdev_priv(ndev);
+ 	struct ipa *ipa = ipa_ndev->rx->ipa;
++	bool filters_ready = false;
+ 	int ret = 0;
+ 
+ 	if (!ipa_ndev->rx->skbs) {
+@@ -1565,11 +1569,17 @@ static int ipa_ndev_open(struct net_device *ndev)
+ 	netif_start_queue(ndev);
+ 	if (ipa_ndev->tx && ipa->qmi) {
+ 		ret = ipa_qmi_apply_modem_filters(ipa->qmi,
+-					  ipa->modem_cfg_emb_pipe_flt);
++					  ipa->modem_cfg_emb_pipe_flt,
++					  &filters_ready);
+ 		if (ret)
+ 			dev_warn(ipa->dev,
+ 				 "modem filter installation/notification failed: %d\n",
+ 				 ret);
++		else if (filters_ready) {
++			iowrite32(1, ipa->mmio + REG_IPA_FILTER_OFST);
++			dev_info(ipa->dev,
++				 "enabled IPA filtering after modem rules became ready\n");
++		}
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/net/ipa2-lite/ipa-qmi.c b/drivers/net/ipa2-lite/ipa-qmi.c
+index 847529c18c73..bda92bf3048b 100644
+--- a/drivers/net/ipa2-lite/ipa-qmi.c
++++ b/drivers/net/ipa2-lite/ipa-qmi.c
+@@ -2006,10 +2006,12 @@ void ipa_qmi_uc_loaded(struct ipa_qmi *ipa_qmi)
+ }
+ 
+ int ipa_qmi_apply_modem_filters(struct ipa_qmi *ipa_qmi,
+-				bool modem_cfg_emb_pipe_flt)
++				bool modem_cfg_emb_pipe_flt,
++				bool *filters_ready)
+ {
+ 	int ret = 0;
+ 
++	*filters_ready = false;
+ 	mutex_lock(&ipa_qmi->filter_lock);
+ 	if (ipa_qmi->filter_rules_pending && modem_cfg_emb_pipe_flt) {
+ 		/* The modem programs the embedded AP producer filter table. */
+@@ -2017,6 +2019,7 @@ int ipa_qmi_apply_modem_filters(struct ipa_qmi *ipa_qmi,
+ 			 "accepted %u modem-owned embedded pipe filters\n",
+ 			 ipa_qmi->filter_rules_count);
+ 		ipa_qmi->filter_rules_pending = false;
++		*filters_ready = true;
+ 	} else if (ipa_qmi->filter_rules_pending) {
+ 		ret = ipa_install_modem_filters(ipa_qmi->dev,
+ 						ipa_qmi->filter_rules,
+@@ -2025,6 +2028,8 @@ int ipa_qmi_apply_modem_filters(struct ipa_qmi *ipa_qmi,
+ 			ret = ipa_qmi_notify_filter_installed(ipa_qmi);
+ 		if (!ret)
+ 			ipa_qmi->filter_rules_pending = false;
++		if (!ret)
++			*filters_ready = true;
+ 	}
+ 	mutex_unlock(&ipa_qmi->filter_lock);
+ 
+-- 
+2.51.0

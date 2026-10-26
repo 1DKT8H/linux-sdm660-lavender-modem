@@ -1,0 +1,48 @@
+From: 1DKT8H <szymonj159@gmail.com>
+Subject: [PATCH] net: ipa2-lite: re-enable AP filters after Q6 call setup
+
+The modem-owned pipe-4 filter pointer observed on SDM660 points at a local
+SRAM table whose body is never populated when ipa2-lite is used.  The AP
+fallback already builds the 24 QMI-provided rules correctly and reapplies
+their pointers after Q6 has finished configuring the data call.  However,
+Q6 also clears IPA_FILTER, so restoring only the pointers still leaves the
+filter engine bypassed and every packet falls through to route index 7.
+
+Keep using the AP-owned fallback until the missing uC programming path is
+implemented.  Re-enable filtering only after both v4 and v6 pointers have
+been committed through the command pipe, immediately before releasing the
+filter lock.  This matches the ordering required by the hardware and avoids
+exposing a partially updated table.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+---
+ arch/arm64/boot/dts/qcom/sdm630.dtsi | 1 -
+ drivers/net/ipa2-lite/ipa.c           | 2 ++
+ 2 files changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm630.dtsi b/arch/arm64/boot/dts/qcom/sdm630.dtsi
+index b459390..564bbb0 100644
+--- a/arch/arm64/boot/dts/qcom/sdm630.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm630.dtsi
+@@ -1040,6 +1040,5 @@
+ 		ipa: ipa@14780000 {
+ 			compatible = "qcom,ipa-lite-v2.6";
+-			qcom,modem-cfg-emb-pipe-flt;
+ 			reg = <0x14780000 0x47000>;
+ 			clocks = <&rpmcc RPM_SMD_IPA_CLK>;
+ 			interrupts = <GIC_SPI 333 IRQ_TYPE_EDGE_RISING>,
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+index c1192a0..c3c8d61 100644
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -705,6 +705,8 @@ static int ipa_filter_reapply(struct ipa *ipa)
+ 	ret = ipa_filter_update_pointer(ipa, MEM_FT_V4, v4_addr);
+ 	if (!ret)
+ 		ret = ipa_filter_update_pointer(ipa, MEM_FT_V6, v6_addr);
++	if (!ret)
++		iowrite32(1, ipa->mmio + REG_IPA_FILTER_OFST);
+ 	mutex_unlock(&ipa->filter_lock);
+ 
+ 	return ret;
+-- 
+2.51.0

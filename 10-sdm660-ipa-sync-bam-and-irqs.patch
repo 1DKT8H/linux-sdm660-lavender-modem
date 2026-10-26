@@ -1,0 +1,86 @@
+From 9bfa2e24bcb853a5d841cb8a6ca5781b9cbbfb51 Mon Sep 17 00:00:00 2001
+From: 1DKT8H <szymonj159@gmail.com>
+Date: Sun, 31 Aug 2026 13:45:00 +0200
+Subject: [PATCH] net: ipa2-lite: match SDM660 BAM and interrupt setup
+
+The downstream SDM660 IPA v2.6L stack programs a 0x10 event generation
+threshold on every system BAM pipe.  It also clears reset-time interrupt
+status before enabling the uC and TX-suspend interrupt set.
+
+Mirror those details and stop acknowledging disabled status bits.  The
+latter is particularly important for the uC queue conditions: downstream
+only acknowledges interrupts for which it has installed a handler.
+
+The downstream TX-suspend handler wakes runtime-suspended consumers.  The
+ipa2-lite data netdev already holds a runtime-PM reference while open, so it
+only needs to consume the endpoint bitmap and acknowledge the interrupt.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+---
+ drivers/net/ipa2-lite/ipa.c | 29 ++++++++++++++++++-----------
+ 1 file changed, 18 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -720,6 +720,7 @@ static void ipa_bam_reset_pipe(struct ipa_ep *ep)
+ 		  mmio + REG_BAM_P_DESC_FIFO_ADDR(id));
+ 	iowrite32(IPA_FIFO_SIZE, mmio + REG_BAM_P_FIFO_SIZES(id));
+ 	iowrite32(0, mmio + REG_BAM_P_IRQ_EN(id));
++	iowrite32(0x10, mmio + REG_BAM_P_EVNT_GEN_TRSHLD(id));
+ 
+ 	val = ep->is_rx ? P_DIRECTION : 0;
+ 
+@@ -1266,7 +1267,7 @@ static irqreturn_t ipa_isr_thread(int irq, void *data)
+ static irqreturn_t ipa_isr_thread(int irq, void *data)
+ {
+ 	struct ipa *ipa = data;
+-	u32 enabled, event, event_param, mask, pending, val;
++	u32 enabled, event, event_param, mask, pending, suspend, val;
+ 
+ 	enabled = ioread32(ipa->mmio + REG_IPA_IRQ_EN_EE0);
+ 	for (;;) {
+@@ -1303,15 +1304,19 @@ static irqreturn_t ipa_isr_thread(int irq, void *data)
+ 				wake_up_all(&ipa->uc_cmd_wq);
+ 			}
+ 		}
+-	}
+ 
+-	/* Status includes disabled conditions; don't leave stale bits latched. */
+-	pending = ioread32(ipa->mmio + REG_IPA_IRQ_STTS_EE0);
+-	if (pending) {
+-		dev_dbg(ipa->dev,
+-			"clearing disabled IPA interrupts %#x (enabled %#x)\n",
+-			pending, enabled);
+-		iowrite32(pending, ipa->mmio + REG_IPA_IRQ_CLR_EE0);
++		if (mask & BIT(IPA_IRQ_TX_SUSPEND_IRQ)) {
++			/*
++			 * Downstream wakes runtime-suspended consumers here.  This
++			 * driver holds a runtime-PM reference while the netdev is open.
++			 */
++			suspend = ioread32(ipa->mmio +
++					   REG_IPA_IRQ_SUSPEND_INFO_EE0);
++			dev_dbg_ratelimited(ipa->dev,
++					    "TX suspend endpoints %#x\n", suspend);
++			iowrite32(BIT(IPA_IRQ_TX_SUSPEND_IRQ),
++				  ipa->mmio + REG_IPA_IRQ_CLR_EE0);
++		}
+ 	}
+ 
+ 	return IRQ_HANDLED;
+@@ -1899,8 +1904,10 @@ static int ipa_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
+-	/* Downstream registers both the uC event and response interrupts. */
+-	iowrite32(BIT(IPA_IRQ_UC_IRQ_0) | BIT(IPA_IRQ_UC_IRQ_1),
++	/* Clear reset residue before exposing the downstream interrupt set. */
++	iowrite32(~0U, ipa->mmio + REG_IPA_IRQ_CLR_EE0);
++	iowrite32(BIT(IPA_IRQ_UC_IRQ_0) | BIT(IPA_IRQ_UC_IRQ_1) |
++		  BIT(IPA_IRQ_TX_SUSPEND_IRQ),
+ 		  ipa->mmio + REG_IPA_IRQ_EN_EE0);
+ 
+ 	ret = of_irq_get_byname(dev->of_node, "ipa");
+-- 
+2.51.0
+

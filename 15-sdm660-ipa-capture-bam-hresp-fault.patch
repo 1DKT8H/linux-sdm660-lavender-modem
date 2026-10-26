@@ -1,0 +1,53 @@
+From: 1DKT8H <szymonj159@gmail.com>
+Subject: [PATCH] net: ipa2-lite: capture AP BAM HRESP fault address
+
+The first IPv4 TX changes AP EE0 IRQ status by bit 0 (bad SNOC access) and
+leaves pipe 4 IRQ status 0x84 (HRESP error plus wake). Record the BAM AHB
+error address/data and the TX descriptor/FIFO state before SSR recovery
+clears the evidence. Restrict all reads to AP-owned BAM and EE0 state.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+
+diff --git a/drivers/net/ipa2-lite/ipa-hw.h b/drivers/net/ipa2-lite/ipa-hw.h
+index a93448b..65468ad 100644
+--- a/drivers/net/ipa2-lite/ipa-hw.h
++++ b/drivers/net/ipa2-lite/ipa-hw.h
+@@ -37,6 +37,9 @@
+ #define BAM_EMPTY_EN			BIT(3)
+ #define BAM_ERROR_EN			BIT(2)
+ #define BAM_HRESP_ERR_EN		BIT(1)
++#define REG_BAM_AHB_MASTER_ERR_CTRLS	BAM_REG(0x1024)
++#define REG_BAM_AHB_MASTER_ERR_ADDR	BAM_REG(0x1028)
++#define REG_BAM_AHB_MASTER_ERR_DATA	BAM_REG(0x102c)
+ 
+ #define REG_BAM_CNFG_BITS		BAM_REG(0x007C)
+ #define REG_BAM_IRQ_SRCS_EE0		BAM_REG(0x3000)
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+index 87443e1..6369a3b 100644
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -1770,6 +1770,7 @@ static void ipa_ndev_suspend_resume(struct net_device *ndev, bool resume)
+ 
+ static void ipa_dump_first_tx_state(struct ipa *ipa)
+ {
++	struct fifo_desc *tx_desc = &ipa->ep[EP_TX].fifo[ipa->ep[EP_TX].head];
+ 	int id;
+ 
+ 	/* Limit diagnostics to the AP's EE0 and AP system pipes. */
+@@ -1788,5 +1789,16 @@ static void ipa_dump_first_tx_state(struct ipa *ipa)
+ 		 ioread32(ipa->mmio + REG_BAM_P_CTRL(EP_RX)),
+ 		 ioread32(ipa->mmio + REG_BAM_P_IRQ_EN(EP_RX)),
+ 		 ioread32(ipa->mmio + REG_IPA_EP_STATUS(EP_RX)));
++	dev_info(ipa->dev,
++		 "BAM error: irq=%#x ctrl=%#x addr=%#x data=%#x; TX fifo dma=%pad hw=%#x size=%#x desc[%u]=%#x/%#x/%#x\n",
++		 ioread32(ipa->mmio + REG_BAM_IRQ_STTS),
++		 ioread32(ipa->mmio + REG_BAM_AHB_MASTER_ERR_CTRLS),
++		 ioread32(ipa->mmio + REG_BAM_AHB_MASTER_ERR_ADDR),
++		 ioread32(ipa->mmio + REG_BAM_AHB_MASTER_ERR_DATA),
++		 &ipa->ep[EP_TX].fifo_obj.addr,
++		 ioread32(ipa->mmio + REG_BAM_P_DESC_FIFO_ADDR(EP_TX)),
++		 ioread32(ipa->mmio + REG_BAM_P_FIFO_SIZES(EP_TX)),
++		 ipa->ep[EP_TX].head, le32_to_cpu(tx_desc->addr),
++		 le16_to_cpu(tx_desc->size), le16_to_cpu(tx_desc->flags));
+ 	for (id = EP_LAN_RX; id <= EP_RX; id++) {
+ 		struct ipa_ep *ep = &ipa->ep[id];

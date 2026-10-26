@@ -1,0 +1,196 @@
+From: 1DKT8H <szymonj159@gmail.com>
+Subject: [PATCH] net: ipa2-lite: model SDM660 IPA buses and modem-owned filters
+
+The SDM660 downstream IPA configuration holds the memory and IMEM paths at
+80/640 MB/s plus an 80 MB/s CPU configuration vote.  It also sets
+qcom,modem-cfg-emb-pipe-flt: the modem, not the AP, owns embedded producer
+filters.  Acquire the described paths and preserve that filter ownership.
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm630.dtsi b/arch/arm64/boot/dts/qcom/sdm630.dtsi
+index fcb893e9e..931b98661 100644
+--- a/arch/arm64/boot/dts/qcom/sdm630.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm630.dtsi
+@@ -1050,6 +1050,7 @@ ipa: ipa@14780000 {
+ 			interconnect-names = "ipa-mem", "ipa-imem", "cpu-cfg";
+ 			iommus = <&anoc2_smmu 0x19C0>;
+ 			modem-remoteproc = <&remoteproc_mss>;
++			qcom,modem-cfg-emb-pipe-flt;
+ 			status = "okay";
+ 
+ 			ipa_smmu_uc: ipa-smmu-uc {
+diff --git a/drivers/net/ipa2-lite/Kconfig b/drivers/net/ipa2-lite/Kconfig
+index ee752c8d8..c1f3b160b 100644
+--- a/drivers/net/ipa2-lite/Kconfig
++++ b/drivers/net/ipa2-lite/Kconfig
+@@ -2,6 +2,7 @@ config QCOM_IPA2_LITE
+ 	tristate "Qualcomm IPA 2.X support"
+ 	depends on NET
+ 	depends on IOMMU_SUPPORT
++	depends on INTERCONNECT
+ 	depends on ARCH_QCOM || COMPILE_TEST
+ 	depends on QCOM_RPROC_COMMON || (QCOM_RPROC_COMMON=n && COMPILE_TEST)
+ 	select QCOM_QMI_HELPERS
+diff --git a/drivers/net/ipa2-lite/ipa-qmi.c b/drivers/net/ipa2-lite/ipa-qmi.c
+index 229f203b5..d9f5b816e 100644
+--- a/drivers/net/ipa2-lite/ipa-qmi.c
++++ b/drivers/net/ipa2-lite/ipa-qmi.c
+@@ -2005,12 +2005,19 @@ bool ipa_qmi_is_modem_ready(struct ipa_qmi *ipa_qmi)
+ 	return ipa_qmi->modem_ready;
+ }
+ 
+-int ipa_qmi_apply_modem_filters(struct ipa_qmi *ipa_qmi)
++int ipa_qmi_apply_modem_filters(struct ipa_qmi *ipa_qmi,
++				bool modem_cfg_emb_pipe_flt)
+ {
+ 	int ret = 0;
+ 
+ 	mutex_lock(&ipa_qmi->filter_lock);
+-	if (ipa_qmi->filter_rules_pending) {
++	if (ipa_qmi->filter_rules_pending && modem_cfg_emb_pipe_flt) {
++		/* The modem programs the embedded AP producer filter table. */
++		dev_info(ipa_qmi->dev,
++			 "accepted %u modem-owned embedded pipe filters\n",
++			 ipa_qmi->filter_rules_count);
++		ipa_qmi->filter_rules_pending = false;
++	} else if (ipa_qmi->filter_rules_pending) {
+ 		ret = ipa_install_modem_filters(ipa_qmi->dev,
+ 						ipa_qmi->filter_rules,
+ 						ipa_qmi->filter_rules_count);
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+index 57919000f..6bcde4227 100644
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -8,6 +8,7 @@
+ #include <linux/if_arp.h>
+ #include <linux/if_rmnet.h>
+ #include <linux/interrupt.h>
++#include <linux/interconnect.h>
+ #include <linux/iommu.h>
+ #include <linux/io.h>
+ #include <linux/module.h>
+@@ -39,6 +40,7 @@
+ #define EP_DMA_DIR(ep)			((ep)->is_rx ? DMA_FROM_DEVICE : DMA_TO_DEVICE)
+ #define IPA_QMI_FILTER_TABLE_SIZE	8192
+ #define IPA_QMI_MODEM_ROUTE_MAX		6
++#define IPA_INTERCONNECT_COUNT		3
+ 
+ #define IPA_V2_6L_SMEM_SIZE		0x2000
+ #define IPA_V2_6L_V4_FT_OFF		0x288
+@@ -117,6 +119,8 @@ struct ipa {
+ 	void __iomem *mmio;
+ 	struct ipa_dma_obj system_hdr, empty_rt;
+ 	struct ipa_dma_obj modem_filter[2], modem_filter_prev[2];
++	struct icc_bulk_data interconnect[IPA_INTERCONNECT_COUNT];
++	bool modem_cfg_emb_pipe_flt;
+ 	struct mutex filter_lock;
+ };
+ 
+@@ -196,6 +200,63 @@ static int devm_ipa_dma_alloc(struct ipa *ipa, struct ipa_dma_obj *obj, u32 size
+ 	return ret;
+ }
+ 
++static void ipa_interconnect_disable(void *data)
++{
++	struct ipa *ipa = data;
++	int i;
++
++	for (i = IPA_INTERCONNECT_COUNT - 1; i >= 0; i--)
++		(void)icc_set_bw(ipa->interconnect[i].path, 0, 0);
++}
++
++static int ipa_interconnect_enable(struct ipa *ipa)
++{
++	struct device *dev = ipa->dev;
++	int ret, i;
++
++	ipa->interconnect[0] = (struct icc_bulk_data) {
++		.name = "ipa-mem",
++		.avg_bw = 80000,
++		.peak_bw = 640000,
++	};
++	ipa->interconnect[1] = (struct icc_bulk_data) {
++		.name = "ipa-imem",
++		.avg_bw = 80000,
++		.peak_bw = 640000,
++	};
++	ipa->interconnect[2] = (struct icc_bulk_data) {
++		.name = "cpu-cfg",
++		.avg_bw = 0,
++		.peak_bw = 80000,
++	};
++
++	ret = devm_of_icc_bulk_get(dev, IPA_INTERCONNECT_COUNT,
++				   ipa->interconnect);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "failed to get IPA interconnects\n");
++
++	for (i = 0; i < IPA_INTERCONNECT_COUNT; i++) {
++		ret = icc_set_bw(ipa->interconnect[i].path,
++				 ipa->interconnect[i].avg_bw,
++				 ipa->interconnect[i].peak_bw);
++		if (ret)
++			goto err_disable;
++	}
++
++	ret = devm_add_action_or_reset(dev, ipa_interconnect_disable, ipa);
++	if (ret)
++		return ret;
++
++	return 0;
++
++err_disable:
++	while (i--)
++		(void)icc_set_bw(ipa->interconnect[i].path, 0, 0);
++
++	return dev_err_probe(dev, ret, "failed to vote IPA interconnects\n");
++}
++
+ static int ipa_filter_put_8(u8 **buf, const u8 *end, u8 val)
+ {
+ 	if (*buf >= end)
+@@ -1486,7 +1547,8 @@ static int ipa_ndev_open(struct net_device *ndev)
+ 
+ 	netif_start_queue(ndev);
+ 	if (ipa_ndev->tx && ipa->qmi) {
+-		ret = ipa_qmi_apply_modem_filters(ipa->qmi);
++		ret = ipa_qmi_apply_modem_filters(ipa->qmi,
++					  ipa->modem_cfg_emb_pipe_flt);
+ 		if (ret)
+ 			dev_warn(ipa->dev,
+ 				 "modem filter installation/notification failed: %d\n",
+@@ -1706,6 +1768,8 @@ static int ipa_probe(struct platform_device *pdev)
+ 	ipa->dev = dev;
+ 	ipa->ssr_nb.notifier_call = ipa_ssr_notifier;
+ 	ipa->test_mode = test_mode;
++	ipa->modem_cfg_emb_pipe_flt =
++		of_property_read_bool(dev->of_node, "qcom,modem-cfg-emb-pipe-flt");
+ 
+ 	atomic_set(&ipa->uc_cmd_busy, 0);
+ 	init_waitqueue_head(&ipa->uc_cmd_wq);
+@@ -1732,6 +1796,10 @@ static int ipa_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, ret,
+ 				     "IPA uC SMMU device is not ready\n");
+ 
++	ret = ipa_interconnect_enable(ipa);
++	if (ret)
++		return ret;
++
+ 	ipa->mmio = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR_OR_NULL(ipa->mmio))
+ 		return PTR_ERR(ipa->mmio) ?: -ENOMEM;
+diff --git a/drivers/net/ipa2-lite/ipa.h b/drivers/net/ipa2-lite/ipa.h
+index 8d8b45003..69cc6cd38 100644
+--- a/drivers/net/ipa2-lite/ipa.h
++++ b/drivers/net/ipa2-lite/ipa.h
+@@ -111,7 +111,8 @@ struct ipa_qmi *ipa_qmi_setup(struct device *dev, const struct ipa_partition *la
+ bool ipa_qmi_is_modem_ready(struct ipa_qmi *ipa_qmi);
+ void ipa_qmi_uc_loaded(struct ipa_qmi *ipa_qmi);
+ void ipa_qmi_teardown(struct ipa_qmi *ipa_qmi);
+-int ipa_qmi_apply_modem_filters(struct ipa_qmi *ipa_qmi);
++int ipa_qmi_apply_modem_filters(struct ipa_qmi *ipa_qmi,
++				bool modem_cfg_emb_pipe_flt);
+ void ipa_modem_set_present(struct device *dev, bool present);
+ int ipa_install_modem_filters(struct device *dev,
+ 			      const struct ipa_qmi_filter_rule *rules, u8 count);
+

@@ -1,0 +1,65 @@
+From: 1DKT8H <szymonj159@gmail.com>
+Subject: [PATCH] net: ipa2-lite: use a translated SMMU domain for AP DMA
+
+The uC stream must remain in an identity domain because modem firmware owns
+its addresses.  The AP stream is different: all BAM descriptor FIFOs and
+packet buffers are allocated or mapped through the DMA API.
+
+Forcing the main IPA device into the Qualcomm identity-client list selects
+the SDM630/660 SMMU bypass path.  On lavender the first TX then raises BAM
+HRESP while reading the second word of the descriptor FIFO, followed by IPA
+BAD_SNOC_ACCESS and the modem ipa_hal.c:2163 assert.  Leave only the uC
+child in the identity-client list and require a translated domain for IPA
+2.6L.
+
+Also handle failure of the 32-bit DMA mask instead of ignoring it.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+
+diff --git a/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c b/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
+index 2fa412648..208a5a541 100644
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
+@@ -398,7 +398,6 @@ static const struct of_device_id qcom_smmu_client_of_match[] __maybe_unused = {
+ 	{ .compatible = "qcom,adreno" },
+ 	{ .compatible = "qcom,adreno-gmu" },
+ 	{ .compatible = "qcom,glymur-mdss" },
+-	{ .compatible = "qcom,ipa-lite-v2.6" },
+ 	{ .compatible = "qcom,ipa-smmu-uc-cb" },
+ 	{ .compatible = "qcom,mdp4" },
+ 	{ .compatible = "qcom,mdss" },
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+index 6369a3b..a6d9308 100644
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -2000,6 +2000,7 @@ static int ipa_smmu_uc_ready(struct device *dev)
+ static int ipa_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
++	struct iommu_domain *domain;
+ 	const char *name = "rmnet_ipa0";
+ 	struct ipa *ipa;
+ 	int ep, ret;
+@@ -2057,7 +2058,21 @@ static int ipa_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, ret,
+ 				     "failed to set active IPA clock rate\n");
+ 
+-	dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "failed to set 32-bit DMA mask\n");
++
++	domain = iommu_get_domain_for_dev(dev);
++	if (!domain)
++		return dev_err_probe(dev, -EPROBE_DEFER,
++				     "AP SMMU domain is not ready\n");
++
++	if (ipa->version == 26 && domain->type == IOMMU_DOMAIN_IDENTITY)
++		return dev_err_probe(dev, -EINVAL,
++				     "IPA 2.6L AP stream cannot use SMMU bypass\n");
++
++	dev_info(dev, "AP SMMU domain type %#x\n", domain->type);
+ 
+ 	ipa_reset_hw(ipa);
+ 

@@ -1,0 +1,116 @@
+From: 1DKT8H <szymonj159@gmail.com>
+Subject: [PATCH] power: reset: qcom-pon: program PS_HOLD for PM8998
+
+The downstream PM660 PON driver programs the PS_HOLD reset type before
+the SoC drops PS_HOLD.  Do the same for the compatible PM8998 Gen2 PON,
+so power-off selects shutdown rather than a hard reset.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+---
+ drivers/power/reset/qcom-pon.c | 77 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 77 insertions(+)
+
+diff --git a/drivers/power/reset/qcom-pon.c b/drivers/power/reset/qcom-pon.c
+index 7e108982a..292a68051 100644
+--- a/drivers/power/reset/qcom-pon.c
++++ b/drivers/power/reset/qcom-pon.c
+@@ -14,6 +14,13 @@
+ 
+ #define PON_SOFT_RB_SPARE		0x8f
+ 
++#define PON_PS_HOLD_RST_CTL		0x5a
++#define PON_PS_HOLD_RST_CTL2		0x5b
++#define PON_PS_HOLD_RESET_EN		BIT(7)
++#define PON_PS_HOLD_TYPE_MASK		GENMASK(3, 0)
++#define PON_PS_HOLD_SHUTDOWN		0x04
++#define PON_PS_HOLD_HARD_RESET		0x07
++
+ #define GEN1_REASON_SHIFT		2
+ #define GEN2_REASON_SHIFT		1
+ 
+@@ -27,6 +34,57 @@ struct qcom_pon {
+ 	long reason_shift;
+ };
+ 
++static int qcom_pon_configure_ps_hold(struct qcom_pon *pon, u8 type)
++{
++	int ret;
++
++	ret = regmap_update_bits(pon->regmap,
++				 pon->baseaddr + PON_PS_HOLD_RST_CTL2,
++				 PON_PS_HOLD_RESET_EN, 0);
++	if (ret)
++		return ret;
++
++	/* Downstream requires ten sleep-clock cycles before changing type. */
++	usleep_range(500, 1000);
++
++	ret = regmap_update_bits(pon->regmap,
++				 pon->baseaddr + PON_PS_HOLD_RST_CTL,
++				 PON_PS_HOLD_TYPE_MASK, type);
++	if (ret)
++		return ret;
++
++	return regmap_update_bits(pon->regmap,
++				  pon->baseaddr + PON_PS_HOLD_RST_CTL2,
++				  PON_PS_HOLD_RESET_EN,
++				  PON_PS_HOLD_RESET_EN);
++}
++
++static int qcom_pon_power_off_prepare(struct sys_off_data *data)
++{
++	struct qcom_pon *pon = data->cb_data;
++	int ret;
++
++	ret = qcom_pon_configure_ps_hold(pon, PON_PS_HOLD_SHUTDOWN);
++	if (ret)
++		dev_err(pon->dev, "failed to configure PS_HOLD for shutdown: %d\n",
++			ret);
++
++	return notifier_from_errno(ret);
++}
++
++static int qcom_pon_restart_prepare(struct sys_off_data *data)
++{
++	struct qcom_pon *pon = data->cb_data;
++	int ret;
++
++	ret = qcom_pon_configure_ps_hold(pon, PON_PS_HOLD_HARD_RESET);
++	if (ret)
++		dev_err(pon->dev, "failed to configure PS_HOLD for restart: %d\n",
++			ret);
++
++	return notifier_from_errno(ret);
++}
++
+ static int qcom_pon_reboot_mode_write(struct reboot_mode_driver *reboot,
+ 				    unsigned int magic)
+ {
+@@ -80,6 +138,25 @@ static int qcom_pon_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	/* Prepare PM8998 PS_HOLD before msm-poweroff drops the signal. */
++	if (of_device_is_compatible(pdev->dev.of_node, "qcom,pm8998-pon")) {
++		error = devm_register_sys_off_handler(&pdev->dev,
++						      SYS_OFF_MODE_POWER_OFF_PREPARE,
++						      SYS_OFF_PRIO_HIGH,
++						      qcom_pon_power_off_prepare, pon);
++		if (error)
++			return dev_err_probe(&pdev->dev, error,
++					     "can't register power-off prepare handler\n");
++
++		error = devm_register_sys_off_handler(&pdev->dev,
++						      SYS_OFF_MODE_RESTART_PREPARE,
++						      SYS_OFF_PRIO_HIGH,
++						      qcom_pon_restart_prepare, pon);
++		if (error)
++			return dev_err_probe(&pdev->dev, error,
++					     "can't register restart prepare handler\n");
++	}
++
+ 	platform_set_drvdata(pdev, pon);
+ 
+ 	return devm_of_platform_populate(&pdev->dev);
+-- 
+2.51.0

@@ -1,0 +1,60 @@
+From: 1DKT8H <szymonj159@gmail.com>
+Subject: [PATCH] net: ipa2-lite: initialize the v2.6L system header table
+
+SDM660 IPA v2.6L keeps the modem header partition in local SRAM, but the
+AP header table lives in system memory.  The global ROUTE register selects
+that system table.  The lite driver only issued HDR_LOCAL_INIT for v2.6L,
+leaving the system table base at zero.  Once AP DMA translation made the TX
+descriptor readable, the first routed packet consequently faulted SID 19c0
+at IOVA zero and crashed the modem in ipa_hal.c.
+
+Match the downstream v2.6L layout: retain the local modem-header
+initialization and additionally allocate the 2048-byte AP DDR header table
+and issue HDR_SYSTEM_INIT.  Zero it so offset zero is the two-byte empty
+exception header used by the default route.
+
+Also make the no-interrupt TX reaper tolerate a BAM reset racing modem SSR.
+Such a reset can move the hardware read pointer past an already-cleared skb
+slot; dereferencing that slot caused the secondary ipa_reap_tx NULL Oops.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+index a6d9308..d1a31fe 100644
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -1165,6 +1165,16 @@ static int ipa_init_sram_part(struct ipa *ipa, enum ipa_part_id mem_id)
+ 		 * This is the sequence used by the SDM660 downstream driver.
+ 		 */
+ 		if (ipa->version == 26) {
++			ret = devm_ipa_dma_alloc(ipa, &ipa->system_hdr, 2048);
++			if (ret)
++				goto free_pld;
++
++			memset(ipa->system_hdr.virt, 0, ipa->system_hdr.size);
++			cmd->hdr_system_init.hdr_table_addr =
++				ipa->system_hdr.addr;
++			ipa_setup_cmd_desc(desc++, IPA_CMD_HDR_SYSTEM_INIT,
++					   &cmd_args, cmd++);
++
+ 			cmd->hdr_local_init.hdr_table_src_addr = pld.addr;
+ 			cmd->hdr_local_init.hdr_table_dst_addr = part_offset;
+ 			cmd->hdr_local_init.size_hdr_table = part->size;
+@@ -1409,10 +1419,17 @@ static int ipa_reap_tx(struct ipa_ep *ep, struct net_device *ndev, int budget)
+ 	while (done < budget && ep->head != off) {
+ 		skb = ep->skbs[ep->head];
+ 		desc = ep->fifo[ep->head];
++		if (WARN_ON_ONCE(!skb)) {
++			dev_err(dev,
++				"TX completion without skb: pipe=%u head=%u hw=%u\n",
++				ep->id, ep->head, off);
++			break;
++		}
+ 
+ 		bytes += skb->len;
+ 		packets++;
+ 
++		ep->skbs[ep->head] = NULL;
+ 		dma_unmap_single(dev, desc.addr, skb->len, DMA_TO_DEVICE);
+ 		dev_consume_skb_any(skb);
+ 		atomic_inc(&ep->free_descs);

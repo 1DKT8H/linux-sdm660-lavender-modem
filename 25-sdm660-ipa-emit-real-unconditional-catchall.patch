@@ -1,0 +1,46 @@
+From: 1DKT8H <szymonj159@gmail.com>
+Subject: [PATCH] net: ipa2-lite: emit a real unconditional catch-all
+
+The terminal IPv4/IPv6 modem rules arrive in either byte-lane representation:
+mask/value 0xf0/0x40 (0x60 for IPv6), or 0xf0000000/0x40000000
+(0x60000000).  The previous workaround recognized only the former while the
+decoded rule used the latter, then serialized to the former.  A live dump of
+the AP table consequently still contained OFFSET_MEQ32_0 and no uplink packet
+matched it.
+
+Recognize both wire representations.  Make the family-terminal rule truly
+unconditional by clearing the equation bitmap and count, rather than retaining
+an OFFSET_MEQ32 operation with a zero mask.  The separate v4/v6 hardware table
+already supplies the family selection.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+---
+ drivers/net/ipa2-lite/ipa.c | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+index c3c8d61..20f4900 100644
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -502,11 +502,14 @@ static int ipa_filter_build(struct ipa *ipa,
+ 		if (rules[i].filter_rule.rule_eq_bitmap == BIT(2) &&
+ 		    rules[i].filter_rule.num_offset_meq_32 == 1 &&
+ 		    rules[i].filter_rule.offset_meq_32[0].offset == 0 &&
+-		    rules[i].filter_rule.offset_meq_32[0].mask == 0xf0 &&
+-		    (rules[i].filter_rule.offset_meq_32[0].value == 0x40 ||
+-		     rules[i].filter_rule.offset_meq_32[0].value == 0x60)) {
++		    ((rules[i].filter_rule.offset_meq_32[0].mask == 0xf0 &&
++		      (rules[i].filter_rule.offset_meq_32[0].value == 0x40 ||
++		       rules[i].filter_rule.offset_meq_32[0].value == 0x60)) ||
++		     (rules[i].filter_rule.offset_meq_32[0].mask == 0xf0000000 &&
++		      (rules[i].filter_rule.offset_meq_32[0].value == 0x40000000 ||
++		       rules[i].filter_rule.offset_meq_32[0].value == 0x60000000)))) {
+ 			family_catchall = rules[i];
+-			family_catchall.filter_rule.offset_meq_32[0].mask = 0;
+-			family_catchall.filter_rule.offset_meq_32[0].value = 0;
++			family_catchall.filter_rule.rule_eq_bitmap = 0;
++			family_catchall.filter_rule.num_offset_meq_32 = 0;
+ 			emit_rule = &family_catchall;
+ 		}
+-- 
+2.51.0

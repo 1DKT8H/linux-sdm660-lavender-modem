@@ -1,0 +1,203 @@
+From: 1DKT8H <szymonj159@gmail.com>
+Subject: [PATCH] net: ipa2-lite: use downstream TX descriptor FIFO size
+
+Downstream configures APPS_LAN_WAN_PROD with a 0x1000-byte descriptor FIFO,
+while the lite driver used 0x800 for every pipe. Keep the existing ring size
+for command and RX pipes, but give the AP TX pipe the matching 0x1000-byte
+FIFO and per-pipe index arithmetic.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+---
+ drivers/net/ipa2-lite/ipa.c | 57 ++++++++++++++++++++++++-------------
+ 1 file changed, 37 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+index 2c1190d..2c1190e 100644
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -30,9 +30,8 @@
+ #include "ipa.h"
+ 
+ #define IPA_FIFO_NUM_DESC		BIT(8)
+-#define IPA_FIFO_IDX_MASK		(IPA_FIFO_NUM_DESC - 1)
+-#define IPA_FIFO_SIZE			(IPA_FIFO_NUM_DESC * sizeof(struct fifo_desc))
+-#define IPA_FIFO_NEXT_IDX(idx)		(((idx) + 1) & IPA_FIFO_IDX_MASK)
++#define IPA_TX_FIFO_NUM_DESC		BIT(9)
++#define IPA_FIFO_NEXT_IDX(ep, idx)	(((idx) + 1) & (ep)->idx_mask)
+ #define IPA_NUM_PIPES			(20)
+ #define IPA_RX_LEN			(8192)
+ #define IPA_NET_MTU			(2048 - IPA_PKT_STATUS_SIZE - 4)
+@@ -99,6 +98,9 @@
+ 	struct ipa_dma_obj fifo_obj;
+ 	struct napi_struct *napi;
+ 	struct sk_buff **skbs;
++	u32 num_desc;
++	u32 idx_mask;
++	u32 fifo_size;
+ 	u32 has_status	    :1;
+ 	u32 id		    :8;
+ 	u32 is_rx	    :1;
+@@ -773,15 +775,15 @@
+ 			IPA_LEGACY_IDLE_CLK_RATE;
+ }
+ 
+-static inline u32 ipa_fifo_offset(void __iomem *reg)
++static inline u32 ipa_fifo_offset(struct ipa_ep *ep, void __iomem *reg)
+ {
+ 	u32 off = readl_relaxed(reg) & 0xffff;
+ 
+ 	off /= sizeof(struct fifo_desc);
+ 
+-	WARN_ON(off & ~IPA_FIFO_IDX_MASK);
++	WARN_ON(off & ~ep->idx_mask);
+ 
+-	return off & IPA_FIFO_IDX_MASK;
++	return off & ep->idx_mask;
+ }
+ 
+ static void ipa_bam_reset_pipe(struct ipa_ep *ep)
+@@ -789,7 +791,7 @@
+ 	void *mmio = ep->ipa->mmio;
+ 	u32 val, id = ep->id;
+ 
+-	atomic_set(&ep->free_descs, IPA_FIFO_NUM_DESC - 1);
++	atomic_set(&ep->free_descs, ep->num_desc - 1);
+ 
+ 	iowrite32(ep->id != EP_CMD, mmio + REG_IPA_EP_CTRL(id));
+ 	iowrite32(ep->is_rx ? 1 : 0, mmio + REG_IPA_EP_HOL_BLOCK_EN(id));
+@@ -805,7 +807,7 @@
+ 	iowrite32(ep->tail * sizeof(struct fifo_desc), ep->reg_wr_off);
+ 	iowrite32(ALIGN(ep->fifo_obj.addr, 8),
+ 		  mmio + REG_BAM_P_DESC_FIFO_ADDR(id));
+-	iowrite32(IPA_FIFO_SIZE, mmio + REG_BAM_P_FIFO_SIZES(id));
++	iowrite32(ep->fifo_size, mmio + REG_BAM_P_FIFO_SIZES(id));
+ 	iowrite32(0, mmio + REG_BAM_P_IRQ_EN(id));
+ 	iowrite32(0x10, mmio + REG_BAM_P_EVNT_GEN_TRSHLD(id));
+ 
+@@ -813,7 +815,8 @@
+ 
+ 	iowrite32(P_SYS_MODE | P_EN | val, mmio + REG_BAM_P_CTRL(id));
+ 
+-	WARN_ON(ipa_fifo_offset(ep->reg_rd_off) != ipa_fifo_offset(ep->reg_wr_off));
++	WARN_ON(ipa_fifo_offset(ep, ep->reg_rd_off) !=
++		ipa_fifo_offset(ep, ep->reg_wr_off));
+ }
+ 
+ static int ipa_setup_ep(struct ipa *ipa, enum ipa_ep_id id)
+@@ -821,7 +824,11 @@
+ 	struct ipa_ep *ep = &ipa->ep[id];
+ 	int ret;
+ 
+-	ret = devm_ipa_dma_alloc(ipa, &ep->fifo_obj, IPA_FIFO_SIZE + 8);
++	ep->num_desc = id == EP_TX ? IPA_TX_FIFO_NUM_DESC : IPA_FIFO_NUM_DESC;
++	ep->idx_mask = ep->num_desc - 1;
++	ep->fifo_size = ep->num_desc * sizeof(struct fifo_desc);
++
++	ret = devm_ipa_dma_alloc(ipa, &ep->fifo_obj, ep->fifo_size + 8);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -838,7 +845,7 @@
+ 	 * ndo_stop must still own this array while draining mapped packets.
+ 	 */
+ 	if (id != EP_CMD) {
+-		ep->skbs = devm_kcalloc(ipa->dev, IPA_FIFO_NUM_DESC,
++		ep->skbs = devm_kcalloc(ipa->dev, ep->num_desc,
+ 				       sizeof(*ep->skbs), GFP_KERNEL);
+ 		if (!ep->skbs)
+ 			return -ENOMEM;
+@@ -924,7 +931,7 @@
+ 	head = ep->head;
+ 
+ 	while (num_descs) {
+-		next = IPA_FIFO_NEXT_IDX(tail);
++		next = IPA_FIFO_NEXT_IDX(ep, tail);
+ 		if (WARN_ON(next == head)) {
+ 			spin_unlock_irqrestore(&ep->lock, flags);
+ 			return -EINVAL;
+@@ -964,11 +971,11 @@
+ 	if (idx != ep->head)
+ 		return -ETIMEDOUT;
+ 
+-	end_idx = (idx + num_descs) & IPA_FIFO_IDX_MASK;
++	end_idx = (idx + num_descs) & ep->idx_mask;
+ 
+ 	do {
+-		while (idx != end_idx && idx != ipa_fifo_offset(ep->reg_rd_off))
+-			idx = IPA_FIFO_NEXT_IDX(idx);
++		while (idx != end_idx && idx != ipa_fifo_offset(ep, ep->reg_rd_off))
++			idx = IPA_FIFO_NEXT_IDX(ep, idx);
+ 
+ 		ep->head = idx;
+ 		if (idx == end_idx)
+@@ -1363,7 +1370,7 @@
+ 
+ 		ep->fifo[head].addr = 0;
+ 		ep->skbs[head] = NULL;
+-		head = IPA_FIFO_NEXT_IDX(head);
++		head = IPA_FIFO_NEXT_IDX(ep, head);
+ 	}
+ }
+ 
+@@ -1500,7 +1507,7 @@
+ 	u32 packets = 0, bytes = 0;
+ 	int done = 0;
+ 
+-	u32 off = ipa_fifo_offset(ep->reg_rd_off);
++	u32 off = ipa_fifo_offset(ep, ep->reg_rd_off);
+ 
+ 	while (done < budget && ep->head != off) {
+ 		skb = ep->skbs[ep->head];
+@@ -1520,11 +1527,11 @@
+ 		dev_consume_skb_any(skb);
+ 		atomic_inc(&ep->free_descs);
+ 
+-		ep->head = IPA_FIFO_NEXT_IDX(ep->head);
++		ep->head = IPA_FIFO_NEXT_IDX(ep, ep->head);
+ 		done++;
+ 
+ 		if (ep->head == off)
+-			off = ipa_fifo_offset(ep->reg_rd_off);
++			off = ipa_fifo_offset(ep, ep->reg_rd_off);
+ 	}
+ 
+ 	if (netif_queue_stopped(ndev) &&
+@@ -1630,7 +1637,7 @@
+ 	dma_addr_t addr;
+ 	int done = 0;
+ 
+-	u32 off = ipa_fifo_offset(ep->reg_rd_off);
++	u32 off = ipa_fifo_offset(ep, ep->reg_rd_off);
+ 
+ 	while (done < budget && ep->head != off) {
+ 		desc = ep->fifo[ep->head];
+@@ -1680,17 +1687,17 @@
+ 		desc.flags = DESC_FLAG_INT;
+ 		ep->skbs[ep->tail] = skb;
+ 		ep->fifo[ep->tail] = desc;
+-		ep->tail = IPA_FIFO_NEXT_IDX(ep->tail);
++		ep->tail = IPA_FIFO_NEXT_IDX(ep, ep->tail);
+ 
+ 		/* Ensure descriptor write completes before updating tail pointer */
+ 		wmb();
+ 
+ 		iowrite32(ep->tail * sizeof(struct fifo_desc), ep->reg_wr_off);
+-		ep->head = IPA_FIFO_NEXT_IDX(ep->head);
++		ep->head = IPA_FIFO_NEXT_IDX(ep, ep->head);
+ 		done++;
+ 
+ 		if (ep->head == off)
+-			off = ipa_fifo_offset(ep->reg_rd_off);
++			off = ipa_fifo_offset(ep, ep->reg_rd_off);
+ 	}
+ 
+ 	ndev->stats.rx_bytes += bytes;
+@@ -1934,7 +1941,7 @@
+ 		goto drop_tx;
+ 
+ 	/* Match downstream's IPA_POLICY_NOINTR_MODE completion polling. */
+-	ipa_reap_tx(ipa_ndev->tx, ndev, IPA_FIFO_NUM_DESC);
++	ipa_reap_tx(ipa_ndev->tx, ndev, ipa_ndev->tx->num_desc);
+ 
+ 	if (!ipa->tx_irq_logged) {
+ 		ipa->tx_irq_logged = true;

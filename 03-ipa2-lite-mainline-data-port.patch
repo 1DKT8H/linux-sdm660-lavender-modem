@@ -1,0 +1,1973 @@
+diff --git a/arch/arm64/boot/dts/qcom/sdm630.dtsi b/arch/arm64/boot/dts/qcom/sdm630.dtsi
+index 80b3d86a9c05bf0e385e2e1a53ce92b8b5b53aa4..fcb893e9e7154a5188f472a1f1c891e76c245e82 100644
+--- a/arch/arm64/boot/dts/qcom/sdm630.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm630.dtsi
+@@ -1048,10 +1048,14 @@ ipa: ipa@14780000 {
+ 			<&a2noc MASTER_IPA &snoc SLAVE_IMEM>,
+ 			<&gnoc MASTER_APSS_PROC &snoc SLAVE_IPA>;
+ 			interconnect-names = "ipa-mem", "ipa-imem", "cpu-cfg";
+-			iommus =  <&anoc2_smmu 0x19C0>,
+-					  <&anoc2_smmu 0x19C2>;
++			iommus = <&anoc2_smmu 0x19C0>;
+ 			modem-remoteproc = <&remoteproc_mss>;
+ 			status = "okay";
++
++			ipa_smmu_uc: ipa-smmu-uc {
++				compatible = "qcom,ipa-smmu-uc-cb";
++				iommus = <&anoc2_smmu 0x19C2>;
++			};
+ 		};
+ 
+ 		remoteproc_mss: remoteproc@4080000 {
+@@ -2879,4 +2883,3 @@ timer {
+ 			     <GIC_PPI 0 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_LOW)>;
+ 	};
+ };
+-
+diff --git a/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c b/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
+index 79e0584dcdca44b244a4720d8bf8a0c015692677..2fa4126484b82299036ac05f3d2daa768a35ae44 100644
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
+@@ -398,6 +398,8 @@ static const struct of_device_id qcom_smmu_client_of_match[] __maybe_unused = {
+ 	{ .compatible = "qcom,adreno" },
+ 	{ .compatible = "qcom,adreno-gmu" },
+ 	{ .compatible = "qcom,glymur-mdss" },
++	{ .compatible = "qcom,ipa-lite-v2.6" },
++	{ .compatible = "qcom,ipa-smmu-uc-cb" },
+ 	{ .compatible = "qcom,mdp4" },
+ 	{ .compatible = "qcom,mdss" },
+ 	{ .compatible = "qcom,msm8998-mss-pil" },
+diff --git a/drivers/net/ipa2-lite/Kconfig b/drivers/net/ipa2-lite/Kconfig
+index 4bed4d74872d6c925436f02fddc58c896eb7e6b8..ee752c8d8776eab1a9ca724cc5f2d8f4f129cea4 100644
+--- a/drivers/net/ipa2-lite/Kconfig
++++ b/drivers/net/ipa2-lite/Kconfig
+@@ -1,6 +1,7 @@
+ config QCOM_IPA2_LITE
+ 	tristate "Qualcomm IPA 2.X support"
+ 	depends on NET
++	depends on IOMMU_SUPPORT
+ 	depends on ARCH_QCOM || COMPILE_TEST
+ 	depends on QCOM_RPROC_COMMON || (QCOM_RPROC_COMMON=n && COMPILE_TEST)
+ 	select QCOM_QMI_HELPERS
+diff --git a/drivers/net/ipa2-lite/ipa-qmi.c b/drivers/net/ipa2-lite/ipa-qmi.c
+index ae06e6df28ba3d37e2f5c9d4f363530dfb42178d..2d1df7fd7cbb227b3c05260717e356d1cca9755c 100644
+--- a/drivers/net/ipa2-lite/ipa-qmi.c
++++ b/drivers/net/ipa2-lite/ipa-qmi.c
+@@ -4,6 +4,8 @@
+  */
+ 
+ #include <linux/device.h>
++#include <linux/mutex.h>
++#include <linux/printk.h>
+ #include <linux/qrtr.h>
+ #include <linux/slab.h>
+ #include <linux/soc/qcom/qmi.h>
+@@ -19,6 +21,8 @@
+ #define IPA_QMI_INDICATION_REGISTER	0x20	/* modem -> AP request */
+ #define IPA_QMI_INIT_DRIVER		0x21	/* AP -> modem request */
+ #define IPA_QMI_INIT_COMPLETE		0x22	/* AP -> modem indication */
++#define IPA_QMI_INSTALL_FILTER_RULE	0x23	/* modem -> AP request */
++#define IPA_QMI_FILTER_INSTALLED_NOTIFY	0x24	/* modem -> AP request */
+ 
+ /* The maximum size required for message types.  These sizes include
+  * the message data, along with type (1 byte) and length (2 byte)
+@@ -30,9 +34,16 @@
+ #define IPA_QMI_INIT_DRIVER_REQ_SZ		162	/* client handle -> */
+ #define IPA_QMI_INIT_DRIVER_RSP_SZ		25	/* client handle <- */
+ #define IPA_QMI_INIT_COMPLETE_IND_SZ		7	/* <- server handle */
++#define IPA_QMI_INSTALL_FILTER_RULE_REQ_SZ	33705
++#define IPA_QMI_INSTALL_FILTER_RULE_RSP_SZ	783
++#define IPA_QMI_FILTER_INSTALLED_NOTIFY_REQ_SZ	1899
++#define IPA_QMI_FILTER_INSTALLED_NOTIFY_RSP_SZ	7
+ 
+-/* Maximum size of messages we expect the AP to receive (max of above) */
+-#define IPA_QMI_SERVER_MAX_RCV_SZ		8
++/* The modem IDL permits 64 entries; downstream keeps a 35-entry HW cache. */
++#define IPA_QMI_WIRE_MAX_FILTERS		64
++
++/* The downstream IPA v2 QMI service advertises 33705 for 0x23. */
++#define IPA_QMI_SERVER_MAX_RCV_SZ		IPA_QMI_INSTALL_FILTER_RULE_REQ_SZ
+ #define IPA_QMI_CLIENT_MAX_RCV_SZ		25
+ 
+ /* Request message for the IPA_QMI_INDICATION_REGISTER request */
+@@ -63,6 +74,437 @@ struct ipa_init_complete_ind {
+ 	struct qmi_response_type_v01 status;
+ };
+ 
++/*
++ * QMI 0x23 structures.  The field order and QMI element descriptions below
++ * are ported from downstream ipa_qmi_service_v01.{h,c}; only the names are
++ * shortened to keep the IPA-lite server self-contained.
++ */
++struct ipa_qmi_install_filter_req {
++	u8 rules_valid;
++	u32 rules_len;
++	struct ipa_qmi_filter_rule rules[IPA_QMI_WIRE_MAX_FILTERS];
++	u8 source_pipe_index_valid;
++	u32 source_pipe_index;
++	u8 num_ipv4_filters_valid;
++	u32 num_ipv4_filters;
++	u8 num_ipv6_filters_valid;
++	u32 num_ipv6_filters;
++	u8 xlat_filter_indices_valid;
++	u32 xlat_filter_indices_len;
++	u32 xlat_filter_indices[IPA_QMI_WIRE_MAX_FILTERS];
++};
++
++struct ipa_qmi_filter_handle_map {
++	u32 identifier;
++	u32 handle;
++};
++
++struct ipa_qmi_filter_handle_index_map {
++	u32 handle;
++	u32 index;
++};
++
++struct ipa_qmi_install_filter_rsp {
++	struct qmi_response_type_v01 rsp;
++	u8 handles_valid;
++	u32 handles_len;
++	struct ipa_qmi_filter_handle_map handles[IPA_QMI_WIRE_MAX_FILTERS];
++};
++
++struct ipa_qmi_filter_installed_notify_req {
++	u32 source_pipe_index;
++	u16 install_status;
++	u32 handles_len;
++	struct ipa_qmi_filter_handle_index_map handles[IPA_QMI_WIRE_MAX_FILTERS];
++};
++
++#define IPA_QMI_EI(_type, _struct, _field) \
++	{ .data_type = _type, .elem_len = 1, \
++	  .elem_size = sizeof_field(_struct, _field), \
++	  .array_type = NO_ARRAY, .tlv_type = QMI_COMMON_TLV_TYPE, \
++	  .offset = offsetof(_struct, _field) }
++#define IPA_QMI_EOTI { .data_type = QMI_EOTI }
++
++static const struct qmi_elem_info ipa_qmi_eq16_ei[] = {
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_eq_16, offset),
++	IPA_QMI_EI(QMI_UNSIGNED_2_BYTE, struct ipa_qmi_eq_16, value),
++	IPA_QMI_EOTI,
++};
++
++static const struct qmi_elem_info ipa_qmi_eq32_ei[] = {
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_eq_32, offset),
++	IPA_QMI_EI(QMI_UNSIGNED_4_BYTE, struct ipa_qmi_eq_32, value),
++	IPA_QMI_EOTI,
++};
++
++static const struct qmi_elem_info ipa_qmi_range_eq16_ei[] = {
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_range_eq_16, offset),
++	IPA_QMI_EI(QMI_UNSIGNED_2_BYTE, struct ipa_qmi_range_eq_16, low),
++	IPA_QMI_EI(QMI_UNSIGNED_2_BYTE, struct ipa_qmi_range_eq_16, high),
++	IPA_QMI_EOTI,
++};
++
++static const struct qmi_elem_info ipa_qmi_mask_eq32_ei[] = {
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_mask_eq_32, offset),
++	IPA_QMI_EI(QMI_UNSIGNED_4_BYTE, struct ipa_qmi_mask_eq_32, mask),
++	IPA_QMI_EI(QMI_UNSIGNED_4_BYTE, struct ipa_qmi_mask_eq_32, value),
++	IPA_QMI_EOTI,
++};
++
++static const struct qmi_elem_info ipa_qmi_mask_eq128_ei[] = {
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_mask_eq_128, offset),
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 16,
++		.elem_size = sizeof(u8),
++		.array_type = STATIC_ARRAY,
++		.tlv_type = QMI_COMMON_TLV_TYPE,
++		.offset = offsetof(struct ipa_qmi_mask_eq_128, mask),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 16,
++		.elem_size = sizeof(u8),
++		.array_type = STATIC_ARRAY,
++		.tlv_type = QMI_COMMON_TLV_TYPE,
++		.offset = offsetof(struct ipa_qmi_mask_eq_128, value),
++	},
++	IPA_QMI_EOTI,
++};
++
++static const struct qmi_elem_info ipa_qmi_filter_rule_ei[] = {
++	IPA_QMI_EI(QMI_UNSIGNED_2_BYTE, struct ipa_qmi_filter_data,
++		      rule_eq_bitmap),
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_filter_data,
++		      tos_eq_present),
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_filter_data, tos_eq),
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_filter_data,
++		      protocol_eq_present),
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_filter_data,
++		      protocol_eq),
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_filter_data,
++		      num_ihl_offset_range_16),
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 2,
++		.elem_size = sizeof(struct ipa_qmi_range_eq_16),
++		.array_type = STATIC_ARRAY,
++		.tlv_type = QMI_COMMON_TLV_TYPE,
++		.offset = offsetof(struct ipa_qmi_filter_data,
++				   ihl_offset_range_16),
++		.ei_array = ipa_qmi_range_eq16_ei,
++	},
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_filter_data,
++		      num_offset_meq_32),
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 2,
++		.elem_size = sizeof(struct ipa_qmi_mask_eq_32),
++		.array_type = STATIC_ARRAY,
++		.tlv_type = QMI_COMMON_TLV_TYPE,
++		.offset = offsetof(struct ipa_qmi_filter_data, offset_meq_32),
++		.ei_array = ipa_qmi_mask_eq32_ei,
++	},
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_filter_data,
++		      tc_eq_present),
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_filter_data, tc_eq),
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_filter_data,
++		      flow_eq_present),
++	IPA_QMI_EI(QMI_UNSIGNED_4_BYTE, struct ipa_qmi_filter_data, flow_eq),
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_filter_data,
++		      ihl_offset_eq_16_present),
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = sizeof(struct ipa_qmi_eq_16),
++		.array_type = NO_ARRAY,
++		.tlv_type = QMI_COMMON_TLV_TYPE,
++		.offset = offsetof(struct ipa_qmi_filter_data, ihl_offset_eq_16),
++		.ei_array = ipa_qmi_eq16_ei,
++	},
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_filter_data,
++		      ihl_offset_eq_32_present),
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = sizeof(struct ipa_qmi_eq_32),
++		.array_type = NO_ARRAY,
++		.tlv_type = QMI_COMMON_TLV_TYPE,
++		.offset = offsetof(struct ipa_qmi_filter_data, ihl_offset_eq_32),
++		.ei_array = ipa_qmi_eq32_ei,
++	},
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_filter_data,
++		      num_ihl_offset_meq_32),
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 2,
++		.elem_size = sizeof(struct ipa_qmi_mask_eq_32),
++		.array_type = STATIC_ARRAY,
++		.tlv_type = QMI_COMMON_TLV_TYPE,
++		.offset = offsetof(struct ipa_qmi_filter_data,
++				   ihl_offset_meq_32),
++		.ei_array = ipa_qmi_mask_eq32_ei,
++	},
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_filter_data,
++		      num_offset_meq_128),
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 2,
++		.elem_size = sizeof(struct ipa_qmi_mask_eq_128),
++		.array_type = STATIC_ARRAY,
++		.tlv_type = QMI_COMMON_TLV_TYPE,
++		.offset = offsetof(struct ipa_qmi_filter_data, offset_meq_128),
++		.ei_array = ipa_qmi_mask_eq128_ei,
++	},
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_filter_data,
++		      metadata_meq32_present),
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = sizeof(struct ipa_qmi_mask_eq_32),
++		.array_type = NO_ARRAY,
++		.tlv_type = QMI_COMMON_TLV_TYPE,
++		.offset = offsetof(struct ipa_qmi_filter_data, metadata_meq32),
++		.ei_array = ipa_qmi_mask_eq32_ei,
++	},
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_filter_data,
++		      ipv4_frag_eq_present),
++	IPA_QMI_EOTI,
++};
++
++static const struct qmi_elem_info ipa_qmi_filter_spec_ei[] = {
++	IPA_QMI_EI(QMI_UNSIGNED_4_BYTE, struct ipa_qmi_filter_rule, identifier),
++	IPA_QMI_EI(QMI_SIGNED_4_BYTE_ENUM, struct ipa_qmi_filter_rule, ip_type),
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = sizeof(struct ipa_qmi_filter_data),
++		.array_type = NO_ARRAY,
++		.tlv_type = QMI_COMMON_TLV_TYPE,
++		/* Matches ipa_filter_spec_type_v01::filter_rule downstream. */
++		.offset = offsetof(struct ipa_qmi_filter_rule, filter_rule),
++		.ei_array = ipa_qmi_filter_rule_ei,
++	},
++	IPA_QMI_EI(QMI_SIGNED_4_BYTE_ENUM, struct ipa_qmi_filter_rule, action),
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_filter_rule,
++		      route_table_index_valid),
++	IPA_QMI_EI(QMI_UNSIGNED_4_BYTE, struct ipa_qmi_filter_rule,
++		      route_table_index),
++	IPA_QMI_EI(QMI_UNSIGNED_1_BYTE, struct ipa_qmi_filter_rule,
++		      mux_id_valid),
++	IPA_QMI_EI(QMI_UNSIGNED_4_BYTE, struct ipa_qmi_filter_rule, mux_id),
++	IPA_QMI_EOTI,
++};
++
++static const struct qmi_elem_info ipa_qmi_install_filter_req_ei[] = {
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = sizeof(u8),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x10,
++		.offset = offsetof(struct ipa_qmi_install_filter_req, rules_valid),
++	},
++	{
++		.data_type = QMI_DATA_LEN,
++		.elem_len = 1,
++		.elem_size = sizeof(u8),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x10,
++		.offset = offsetof(struct ipa_qmi_install_filter_req, rules_len),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = IPA_QMI_WIRE_MAX_FILTERS,
++		.elem_size = sizeof(struct ipa_qmi_filter_rule),
++		.array_type = VAR_LEN_ARRAY,
++		.tlv_type = 0x10,
++		.offset = offsetof(struct ipa_qmi_install_filter_req, rules),
++		.ei_array = ipa_qmi_filter_spec_ei,
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = sizeof(u8),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x11,
++		.offset = offsetof(struct ipa_qmi_install_filter_req,
++				   source_pipe_index_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = sizeof(u32),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x11,
++		.offset = offsetof(struct ipa_qmi_install_filter_req,
++				   source_pipe_index),
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = sizeof(u8),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x12,
++		.offset = offsetof(struct ipa_qmi_install_filter_req,
++				   num_ipv4_filters_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = sizeof(u32),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x12,
++		.offset = offsetof(struct ipa_qmi_install_filter_req,
++				   num_ipv4_filters),
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = sizeof(u8),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x13,
++		.offset = offsetof(struct ipa_qmi_install_filter_req,
++				   num_ipv6_filters_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = sizeof(u32),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x13,
++		.offset = offsetof(struct ipa_qmi_install_filter_req,
++				   num_ipv6_filters),
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = sizeof(u8),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x14,
++		.offset = offsetof(struct ipa_qmi_install_filter_req,
++				   xlat_filter_indices_valid),
++	},
++	{
++		.data_type = QMI_DATA_LEN,
++		.elem_len = 1,
++		.elem_size = sizeof(u8),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x14,
++		.offset = offsetof(struct ipa_qmi_install_filter_req,
++				   xlat_filter_indices_len),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = IPA_QMI_WIRE_MAX_FILTERS,
++		.elem_size = sizeof(u32),
++		.array_type = VAR_LEN_ARRAY,
++		.tlv_type = 0x14,
++		.offset = offsetof(struct ipa_qmi_install_filter_req,
++				   xlat_filter_indices),
++	},
++	IPA_QMI_EOTI,
++};
++
++static const struct qmi_elem_info ipa_qmi_filter_handle_map_ei[] = {
++	IPA_QMI_EI(QMI_UNSIGNED_4_BYTE, struct ipa_qmi_filter_handle_map,
++		      identifier),
++	IPA_QMI_EI(QMI_UNSIGNED_4_BYTE, struct ipa_qmi_filter_handle_map,
++		      handle),
++	IPA_QMI_EOTI,
++};
++
++static const struct qmi_elem_info ipa_qmi_install_filter_rsp_ei[] = {
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = sizeof(struct qmi_response_type_v01),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x02,
++		.offset = offsetof(struct ipa_qmi_install_filter_rsp, rsp),
++		.ei_array = qmi_response_type_v01_ei,
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = sizeof(u8),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x10,
++		.offset = offsetof(struct ipa_qmi_install_filter_rsp,
++				   handles_valid),
++	},
++	{
++		.data_type = QMI_DATA_LEN,
++		.elem_len = 1,
++		.elem_size = sizeof(u8),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x10,
++		.offset = offsetof(struct ipa_qmi_install_filter_rsp, handles_len),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = IPA_QMI_WIRE_MAX_FILTERS,
++		.elem_size = sizeof(struct ipa_qmi_filter_handle_map),
++		.array_type = VAR_LEN_ARRAY,
++		.tlv_type = 0x10,
++		.offset = offsetof(struct ipa_qmi_install_filter_rsp, handles),
++		.ei_array = ipa_qmi_filter_handle_map_ei,
++	},
++	IPA_QMI_EOTI,
++};
++
++static const struct qmi_elem_info ipa_qmi_filter_handle_index_map_ei[] = {
++	IPA_QMI_EI(QMI_UNSIGNED_4_BYTE,
++		      struct ipa_qmi_filter_handle_index_map, handle),
++	IPA_QMI_EI(QMI_UNSIGNED_4_BYTE,
++		      struct ipa_qmi_filter_handle_index_map, index),
++	IPA_QMI_EOTI,
++};
++
++static const struct qmi_elem_info ipa_qmi_filter_installed_notify_req_ei[] = {
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = sizeof(u32),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x01,
++		.offset = offsetof(struct ipa_qmi_filter_installed_notify_req,
++				   source_pipe_index),
++	},
++	{
++		.data_type = QMI_UNSIGNED_2_BYTE,
++		.elem_len = 1,
++		.elem_size = sizeof(u16),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x02,
++		.offset = offsetof(struct ipa_qmi_filter_installed_notify_req,
++				   install_status),
++	},
++	{
++		.data_type = QMI_DATA_LEN,
++		.elem_len = 1,
++		.elem_size = sizeof(u8),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x03,
++		.offset = offsetof(struct ipa_qmi_filter_installed_notify_req,
++				   handles_len),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = IPA_QMI_WIRE_MAX_FILTERS,
++		.elem_size = sizeof(struct ipa_qmi_filter_handle_index_map),
++		.array_type = VAR_LEN_ARRAY,
++		.tlv_type = 0x03,
++		.offset = offsetof(struct ipa_qmi_filter_installed_notify_req,
++				   handles),
++		.ei_array = ipa_qmi_filter_handle_index_map_ei,
++	},
++	IPA_QMI_EOTI,
++};
++
++#undef IPA_QMI_EI
++#undef IPA_QMI_EOTI
++
+ /* The AP tells the modem its platform type.  We assume Android. */
+ enum ipa_platform_type {
+ 	IPA_QMI_PLATFORM_TYPE_INVALID		= 0x0,	/* Invalid */
+@@ -912,6 +1354,11 @@ struct ipa_qmi {
+ 	/* Information used for the client handle */
+ 	struct sockaddr_qrtr modem_sq;
+ 	struct work_struct init_driver_work;
++	struct mutex filter_lock;
++	struct ipa_qmi_filter_rule filter_rules[IPA_QMI_MAX_FILTERS];
++	u32 filter_rules_count;
++	u32 filter_source_pipe;
++	bool filter_rules_pending;
+ 
+ 	/* Flags used in negotiating readiness */
+ 	bool initial_boot   :1;
+@@ -1057,11 +1505,22 @@ static void ipa_server_bye(struct qmi_handle *qmi, unsigned int node)
+ 	ipa_qmi->indication_requested = false;
+ 	ipa_qmi->indication_sent = false;
+ 
++	/* ipa_init_sram() restores empty filter pointers during an SSR. */
++	mutex_lock(&ipa_qmi->filter_lock);
++	if (ipa_qmi->filter_rules_count)
++		ipa_qmi->filter_rules_pending = true;
++	mutex_unlock(&ipa_qmi->filter_lock);
++
+ 	ipa_modem_set_present(ipa_qmi->dev, false);
+ }
+ 
++static void ipa_server_message(struct qmi_handle *qmi,
++			       struct sockaddr_qrtr *sq,
++			       const void *data, size_t count);
++
+ static const struct qmi_ops ipa_server_ops = {
+ 	.bye		= ipa_server_bye,
++	.msg_handler	= ipa_server_message,
+ };
+ 
+ /* Callback function to handle an INDICATION_REGISTER request message from the
+@@ -1094,17 +1553,168 @@ static void ipa_server_indication_register(struct qmi_handle *qmi,
+ 	}
+ }
+ 
+-/* The server handles two request message types sent by the modem. */
+-static const struct qmi_msg_handler ipa_server_msg_handlers[] = {
+-	{
+-		.type		= QMI_REQUEST,
+-		.msg_id		= IPA_QMI_INDICATION_REGISTER,
+-		.ei		= ipa_indication_register_req_ei,
+-		.decoded_size	= IPA_QMI_INDICATION_REGISTER_REQ_SZ,
+-		.fn		= ipa_server_indication_register,
+-	},
+-	{ },
+-};
++static void ipa_server_basic_response(struct qmi_handle *qmi,
++			      struct sockaddr_qrtr *sq, struct qmi_txn *txn,
++			      u16 msg_id, u16 result, u16 error)
++{
++	struct ipa_indication_register_rsp rsp = { };
++	struct ipa_qmi *ipa_qmi;
++	int ret;
++
++	ipa_qmi = container_of(qmi, struct ipa_qmi, server_handle);
++	rsp.rsp.result = result;
++	rsp.rsp.error = error;
++	ret = qmi_send_response(qmi, sq, txn, msg_id,
++				IPA_QMI_INDICATION_REGISTER_RSP_SZ,
++				ipa_indication_register_rsp_ei, &rsp);
++	if (ret)
++		dev_err(ipa_qmi->dev, "error %d replying to IPA QMI message 0x%x\n",
++			ret, msg_id);
++}
++
++static void ipa_server_install_filter(struct qmi_handle *qmi,
++			      struct sockaddr_qrtr *sq, struct qmi_txn *txn,
++			      const void *data, size_t count)
++{
++	struct ipa_qmi_install_filter_req *req;
++	struct ipa_qmi_install_filter_rsp rsp = { };
++	struct ipa_qmi *ipa_qmi;
++	u32 i;
++	int ret;
++
++	ipa_qmi = container_of(qmi, struct ipa_qmi, server_handle);
++	req = kzalloc(sizeof(*req), GFP_KERNEL);
++	if (!req) {
++		dev_err(ipa_qmi->dev,
++			"out of memory decoding IPA QMI filter request\n");
++		return;
++	}
++
++	/*
++	 * The first 256 bytes contain the QMI header and the beginning of the
++	 * legacy filter-spec list.  This is control-plane data (not user traffic)
++	 * and lets us validate a firmware/IDL mismatch without guessing fields.
++	 */
++	print_hex_dump(KERN_INFO, "ipa QMI 0x23: ", DUMP_PREFIX_OFFSET,
++		       16, 1, data, min_t(size_t, count, 256), false);
++	ret = qmi_decode_message(data, count, ipa_qmi_install_filter_req_ei, req);
++	if (ret < 0 || !req->rules_valid ||
++	    req->rules_len > IPA_QMI_MAX_FILTERS ||
++	    (req->num_ipv4_filters_valid &&
++	     req->num_ipv4_filters > req->rules_len) ||
++	    (req->num_ipv6_filters_valid &&
++	     req->num_ipv6_filters > req->rules_len) ||
++	    (req->xlat_filter_indices_valid &&
++	     req->xlat_filter_indices_len > req->rules_len)) {
++		dev_err(ipa_qmi->dev, "invalid IPA QMI filter request: %d\n",
++			ret);
++		kfree(req);
++		return;
++	}
++	for (i = 0; i < req->xlat_filter_indices_len; i++)
++		if (req->xlat_filter_indices[i] >= req->rules_len) {
++			dev_err(ipa_qmi->dev, "invalid IPA QMI XLAT filter index %u\n",
++				req->xlat_filter_indices[i]);
++			kfree(req);
++			return;
++		}
++
++	mutex_lock(&ipa_qmi->filter_lock);
++	memcpy(ipa_qmi->filter_rules, req->rules,
++	       req->rules_len * sizeof(req->rules[0]));
++	ipa_qmi->filter_rules_count = req->rules_len;
++	/*
++	 * The modem's pipe IDs describe its own IPA view.  Downstream ignores
++	 * this optional field and always uses APPS_LAN_WAN_PROD; IPA-lite's
++	 * corresponding local endpoint is EP_TX.
++	 */
++	ipa_qmi->filter_source_pipe = EP_TX;
++	ipa_qmi->filter_rules_pending = true;
++	mutex_unlock(&ipa_qmi->filter_lock);
++
++	if (req->rules_len)
++		dev_info(ipa_qmi->dev,
++			 "cached %u modem filters: local pipe=%u, requested pipe=%u%s, v4=%u%s, v6=%u%s, xlat=%u; first id=%#x ip=%u action=%u bitmap=%#x route=%u\n",
++			 req->rules_len, ipa_qmi->filter_source_pipe,
++			 req->source_pipe_index,
++			 req->source_pipe_index_valid ? "" : "?",
++			 req->num_ipv4_filters, req->num_ipv4_filters_valid ? "" : "?",
++			 req->num_ipv6_filters, req->num_ipv6_filters_valid ? "" : "?",
++			 req->xlat_filter_indices_len, req->rules[0].identifier,
++			 req->rules[0].ip_type, req->rules[0].action,
++			 req->rules[0].filter_rule.rule_eq_bitmap,
++			 req->rules[0].route_table_index);
++	else
++		dev_info(ipa_qmi->dev, "cached modem filter-table clear request\n");
++
++	rsp.rsp.result = QMI_RESULT_SUCCESS_V01;
++	rsp.rsp.error = QMI_ERR_NONE_V01;
++	rsp.handles_valid = true;
++	rsp.handles_len = req->rules_len;
++	for (i = 0; i < req->rules_len; i++) {
++		rsp.handles[i].identifier = req->rules[i].identifier;
++		rsp.handles[i].handle = 69 + i; /* UL_FILTER_RULE_HANDLE_START */
++	}
++	ret = qmi_send_response(qmi, sq, txn, IPA_QMI_INSTALL_FILTER_RULE,
++				IPA_QMI_INSTALL_FILTER_RULE_RSP_SZ,
++				ipa_qmi_install_filter_rsp_ei, &rsp);
++	if (ret)
++		dev_err(ipa_qmi->dev, "error %d replying to IPA filter request\n",
++			ret);
++
++	kfree(req);
++}
++
++/*
++ * The generic QMI dispatcher cannot receive 0x23 because older ipa2-lite
++ * advertised an eight-byte server buffer.  Decode 0x23 with the downstream
++ * service description while retaining the existing handshake behaviour.
++ */
++static void ipa_server_message(struct qmi_handle *qmi,
++			       struct sockaddr_qrtr *sq,
++			       const void *data, size_t count)
++{
++	const struct qmi_header *hdr = data;
++	struct qmi_txn txn = { };
++	struct ipa_qmi *ipa_qmi;
++	u16 msg_id;
++
++	if (count < sizeof(*hdr)) {
++		pr_err("ipa2-lite: short IPA QMI message\n");
++		return;
++	}
++	if (le16_to_cpu(hdr->msg_len) > count - sizeof(*hdr)) {
++		pr_err("ipa2-lite: truncated IPA QMI message\n");
++		return;
++	}
++	if (hdr->type != QMI_REQUEST)
++		return;
++
++	ipa_qmi = container_of(qmi, struct ipa_qmi, server_handle);
++	txn.id = le16_to_cpu(hdr->txn_id);
++	msg_id = le16_to_cpu(hdr->msg_id);
++
++	switch (msg_id) {
++	case IPA_QMI_INDICATION_REGISTER:
++		ipa_server_indication_register(qmi, sq, &txn, NULL);
++		break;
++	case IPA_QMI_INSTALL_FILTER_RULE:
++		ipa_server_install_filter(qmi, sq, &txn, data, count);
++		break;
++	case IPA_QMI_FILTER_INSTALLED_NOTIFY:
++		/* The downstream server acknowledges this notification only. */
++		ipa_server_basic_response(qmi, sq, &txn, msg_id,
++					  QMI_RESULT_SUCCESS_V01,
++					  QMI_ERR_NONE_V01);
++		break;
++	default:
++		dev_dbg(ipa_qmi->dev, "unsupported IPA QMI request 0x%x\n", msg_id);
++		ipa_server_basic_response(qmi, sq, &txn, msg_id,
++					  QMI_RESULT_FAILURE_V01,
++					  QMI_ERR_NOT_SUPPORTED_V01);
++		break;
++	}
++}
+ 
+ /* Handle an INIT_DRIVER response message from the modem. */
+ static void ipa_client_init_driver(struct qmi_handle *qmi,
+@@ -1115,7 +1739,17 @@ static void ipa_client_init_driver(struct qmi_handle *qmi,
+ 	complete(&txn->completion);
+ }
+ 
+-/* The client handles one response message type sent by the modem. */
++static void ipa_client_filter_installed(struct qmi_handle *qmi,
++					struct sockaddr_qrtr *sq,
++					struct qmi_txn *txn, const void *decoded)
++{
++	const struct ipa_indication_register_rsp *rsp = decoded;
++
++	txn->result = rsp->rsp.result == QMI_RESULT_SUCCESS_V01 ? 0 : -EIO;
++	complete(&txn->completion);
++}
++
++	/* The client receives responses for both IPA requests issued by the AP. */
+ static const struct qmi_msg_handler ipa_client_msg_handlers[] = {
+ 	{
+ 		.type		= QMI_RESPONSE,
+@@ -1124,9 +1758,70 @@ static const struct qmi_msg_handler ipa_client_msg_handlers[] = {
+ 		.decoded_size	= IPA_QMI_INIT_DRIVER_RSP_SZ,
+ 		.fn		= ipa_client_init_driver,
+ 	},
++	{
++		.type		= QMI_RESPONSE,
++		.msg_id		= IPA_QMI_FILTER_INSTALLED_NOTIFY,
++		.ei		= ipa_indication_register_rsp_ei,
++		.decoded_size	= IPA_QMI_FILTER_INSTALLED_NOTIFY_RSP_SZ,
++		.fn		= ipa_client_filter_installed,
++	},
+ 	{ },
+ };
+ 
++static int ipa_qmi_notify_filter_installed(struct ipa_qmi *ipa_qmi)
++{
++	unsigned long timeout = msecs_to_jiffies(QMI_INIT_DRIVER_TIMEOUT);
++	struct ipa_qmi_filter_installed_notify_req req = { };
++	struct qmi_handle *qmi = &ipa_qmi->client_handle;
++	struct qmi_txn txn;
++	u8 i, v4_index = 0, v6_index = 0;
++	int ret;
++
++	if (!ipa_qmi->modem_ready)
++		return -EAGAIN;
++
++	/* This is the local APPS_LAN_WAN_PROD equivalent (EP_TX). */
++	req.source_pipe_index = ipa_qmi->filter_source_pipe;
++	req.install_status = QMI_RESULT_SUCCESS_V01;
++	req.handles_len = ipa_qmi->filter_rules_count;
++	for (i = 0; i < req.handles_len; i++) {
++		req.handles[i].handle = 69 + i; /* UL_FILTER_RULE_HANDLE_START */
++		switch (ipa_qmi->filter_rules[i].ip_type) {
++		case 1: /* QMI_IPA_IP_TYPE_V4 */
++			req.handles[i].index = v4_index++;
++			break;
++		case 2: /* QMI_IPA_IP_TYPE_V6 */
++			req.handles[i].index = v6_index++;
++			break;
++		default:
++			return -EOPNOTSUPP;
++		}
++	}
++
++	ret = qmi_txn_init(qmi, &txn, NULL, NULL);
++	if (ret < 0)
++		return ret;
++
++	ret = qmi_send_request(qmi, &ipa_qmi->modem_sq, &txn,
++			       IPA_QMI_FILTER_INSTALLED_NOTIFY,
++			       IPA_QMI_FILTER_INSTALLED_NOTIFY_REQ_SZ,
++			       ipa_qmi_filter_installed_notify_req_ei, &req);
++	if (ret)
++		goto out_cancel;
++
++	ret = qmi_txn_wait(&txn, timeout);
++	if (!ret) {
++		dev_info(ipa_qmi->dev,
++			 "modem acknowledged %u installed uplink filters on pipe %u\n",
++			 req.handles_len, req.source_pipe_index);
++		return 0;
++	}
++
++out_cancel:
++	qmi_txn_cancel(&txn);
++	return ret;
++}
++
+ /* Return a pointer to an init modem driver request structure, which contains
+  * configuration parameters for the modem.  The modem may be started multiple
+  * times, but generally these parameters don't change so we can reuse the
+@@ -1140,7 +1835,7 @@ init_modem_driver_req(struct ipa_qmi *ipa_qmi, struct ipa_init_modem_driver_req
+ 	const struct ipa_partition *mem = ipa_qmi->mem_layout;
+ 
+ 	/* The microcontroller is initialized on the first boot */
+-	req->skip_uc_load_valid = 1;
++	req->skip_uc_load_valid = ipa_qmi->uc_loaded ? 1 : 0;
+ 	req->skip_uc_load = ipa_qmi->uc_loaded ? 1 : 0;
+ 
+ 	req->platform_type_valid = 1;
+@@ -1162,11 +1857,11 @@ init_modem_driver_req(struct ipa_qmi *ipa_qmi, struct ipa_init_modem_driver_req
+ 	req->hdr_tbl_info_valid = !!mem[MEM_MDM_HDR].size;
+ 
+ 	req->v4_route_tbl_info.start = mem[MEM_RT_V4].offset;
+-	req->v4_route_tbl_info.end = mem[MEM_RT_V4].size / 4 - 1;
++	req->v4_route_tbl_info.end = 6;
+ 	req->v4_route_tbl_info_valid = 1;
+ 
+ 	req->v6_route_tbl_info.start = mem[MEM_RT_V6].offset;
+-	req->v6_route_tbl_info.end = mem[MEM_RT_V6].size / 4 - 1;
++	req->v6_route_tbl_info.end = 6;
+ 	req->v6_route_tbl_info_valid = 1;
+ 
+ 	req->v4_filter_tbl_start = mem[MEM_FT_V4].offset;
+@@ -1180,7 +1875,7 @@ init_modem_driver_req(struct ipa_qmi *ipa_qmi, struct ipa_init_modem_driver_req
+ static void ipa_client_init_driver_work(struct work_struct *work)
+ {
+ 	unsigned long timeout = msecs_to_jiffies(QMI_INIT_DRIVER_TIMEOUT);
+-	struct ipa_init_modem_driver_req req;
++	struct ipa_init_modem_driver_req req = { };
+ 	struct ipa_qmi *ipa_qmi;
+ 	struct qmi_handle *qmi;
+ 	struct qmi_txn txn;
+@@ -1256,6 +1951,7 @@ struct ipa_qmi *ipa_qmi_setup(struct device *dev, const struct ipa_partition *la
+ 	ipa_qmi->dev = dev;
+ 	ipa_qmi->initial_boot = true;
+ 	ipa_qmi->mem_layout = layout;
++	mutex_init(&ipa_qmi->filter_lock);
+ 
+ 	/* The server handle is used to handle the DRIVER_INIT_COMPLETE
+ 	 * request on the first modem boot.  It also receives the
+@@ -1265,7 +1962,7 @@ struct ipa_qmi *ipa_qmi_setup(struct device *dev, const struct ipa_partition *la
+ 	 */
+ 	ret = qmi_handle_init(&ipa_qmi->server_handle,
+ 			      IPA_QMI_SERVER_MAX_RCV_SZ, &ipa_server_ops,
+-			      ipa_server_msg_handlers);
++			      NULL);
+ 	if (ret)
+ 		goto err_free;
+ 
+@@ -1321,10 +2018,29 @@ bool ipa_qmi_is_modem_ready(struct ipa_qmi *ipa_qmi)
+ 	return ipa_qmi->modem_ready;
+ }
+ 
++int ipa_qmi_apply_modem_filters(struct ipa_qmi *ipa_qmi)
++{
++	int ret = 0;
++
++	mutex_lock(&ipa_qmi->filter_lock);
++	if (ipa_qmi->filter_rules_pending) {
++		ret = ipa_install_modem_filters(ipa_qmi->dev,
++						ipa_qmi->filter_rules,
++						ipa_qmi->filter_rules_count);
++		if (!ret)
++			ret = ipa_qmi_notify_filter_installed(ipa_qmi);
++		if (!ret)
++			ipa_qmi->filter_rules_pending = false;
++	}
++	mutex_unlock(&ipa_qmi->filter_lock);
++
++	return ret;
++}
++
+ /* Tear down IPA QMI handles */
+ void ipa_qmi_teardown(struct ipa_qmi *ipa_qmi)
+ {
+ 	cancel_work_sync(&ipa_qmi->init_driver_work);
+ 
+ 	qmi_handle_release(&ipa_qmi->client_handle);
+ 	memset(&ipa_qmi->client_handle, 0, sizeof(ipa_qmi->client_handle));
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+index 5ae4af0f01f371656fbc5dcb3cb7a35d4cacba5a..ed08652281e6abf244b5372c2471d1c4469b295a 100644
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -8,18 +8,22 @@
+ #include <linux/if_arp.h>
+ #include <linux/if_rmnet.h>
+ #include <linux/interrupt.h>
++#include <linux/iommu.h>
+ #include <linux/io.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/netdevice.h>
+ #include <linux/notifier.h>
+ #include <linux/of_device.h>
+ #include <linux/of_irq.h>
++#include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/remoteproc.h>
+ #include <linux/remoteproc/qcom_rproc.h>
+ #include <linux/spinlock.h>
+ #include <linux/sysfs.h>
++#include <linux/unaligned.h>
+ 
+ #include "ipa-hw.h"
+ #include "ipa.h"
+@@ -33,6 +37,22 @@
+ #define IPA_TX_STOP_FREE_THRESH		(0)
+ #define IPA_PIPE_IRQ_MASK		(P_PRCSD_DESC_EN | P_ERR_EN | P_TRNSFR_END_EN)
+ #define EP_DMA_DIR(ep)			((ep)->is_rx ? DMA_FROM_DEVICE : DMA_TO_DEVICE)
++#define IPA_QMI_FILTER_TABLE_SIZE	8192
++#define IPA_QMI_MODEM_ROUTE_MAX		6
++
++#define IPA_V2_6L_SMEM_SIZE		0x2000
++#define IPA_V2_6L_V4_FT_OFF		0x288
++#define IPA_V2_6L_V6_FT_OFF		0x2e8
++#define IPA_V2_6L_V4_RT_OFF		0x348
++#define IPA_V2_6L_V6_RT_OFF		0x388
++#define IPA_V2_6L_MDM_HDR_OFF		0x3c8
++#define IPA_V2_6L_MDM_COMP_OFF	0x510
++#define IPA_V2_6L_MDM_OFF		0x714
++#define IPA_V2_6L_FT_SIZE		88
++#define IPA_V2_6L_RT_SIZE		60
++#define IPA_V2_6L_MDM_HDR_SIZE	320
++#define IPA_V2_6L_MDM_COMP_SIZE	512
++#define IPA_V2_6L_MDM_SIZE		6376
+ 
+ static bool test_mode;
+ module_param(test_mode, bool, 0644);
+@@ -92,9 +112,12 @@ struct ipa {
+ 	struct wait_queue_head uc_cmd_wq;
+ 	u32 *smem_uc_loaded;
+ 	u32 version, smem_size, smem_restr_bytes;
++	bool uc_loaded;
+ 	void *ssr_cookie;
+ 	void __iomem *mmio;
+-	struct ipa_dma_obj system_hdr;
++	struct ipa_dma_obj system_hdr, empty_rt;
++	struct ipa_dma_obj modem_filter[2], modem_filter_prev[2];
++	struct mutex filter_lock;
+ };
+ 
+ struct ipa_ndev {
+@@ -103,6 +126,14 @@ struct ipa_ndev {
+ 	struct napi_struct napi_tx[];
+ };
+ 
++static void ipa_release_descs(struct ipa_ep *ep, int reserved);
++static int ipa_reserve_descs(struct ipa_ep *ep, int count);
++static int ipa_submit_sync(struct ipa_ep *ep, struct fifo_desc *descs,
++			   int num_descs);
++static void ipa_setup_cmd_desc(struct fifo_desc *desc,
++			       enum ipa_cmd_opcode opcode,
++			       struct ipa_dma_obj *cmd_args_obj, void *cmd_args_ptr);
++
+ #define FT4_EP0_OFF (2 + 3 * 0)
+ #define FT4_EP4_OFF (2 + 3 * 1)
+ #define RT4_EP0_OFF (2 + 3 * 2)
+@@ -165,6 +196,381 @@ static int devm_ipa_dma_alloc(struct ipa *ipa, struct ipa_dma_obj *obj, u32 size
+ 	return ret;
+ }
+ 
++static int ipa_filter_put_8(u8 **buf, const u8 *end, u8 val)
++{
++	if (*buf >= end)
++		return -ENOSPC;
++
++	*(*buf)++ = val;
++	return 0;
++}
++
++static int ipa_filter_put_16(u8 **buf, const u8 *end, u16 val)
++{
++	if (end - *buf < sizeof(val))
++		return -ENOSPC;
++
++	put_unaligned_le16(val, *buf);
++	*buf += sizeof(val);
++	return 0;
++}
++
++static int ipa_filter_put_32(u8 **buf, const u8 *end, u32 val)
++{
++	if (end - *buf < sizeof(val))
++		return -ENOSPC;
++
++	put_unaligned_le32(val, *buf);
++	*buf += sizeof(val);
++	return 0;
++}
++
++static int ipa_filter_pad_32(u8 **buf, const u8 *end)
++{
++	while ((unsigned long)*buf & 3) {
++		if (ipa_filter_put_8(buf, end, 0))
++			return -ENOSPC;
++	}
++
++	return 0;
++}
++
++/*
++ * This is ipa_generate_hw_rule_from_eq() from the downstream IPA v2 driver,
++ * expressed against the QMI-decoded rule rather than its userspace ioctl
++ * wrapper.  The order is hardware ABI and must not be changed.
++ */
++static int ipa_filter_emit_eq(const struct ipa_qmi_filter_data *rule,
++			      u8 **buf, const u8 *end)
++{
++	u8 i;
++	int ret;
++
++	if (rule->num_offset_meq_32 > 2 ||
++	    rule->num_ihl_offset_range_16 > 2 ||
++	    rule->num_ihl_offset_meq_32 > 2 ||
++	    rule->num_offset_meq_128 > 2)
++		return -EINVAL;
++
++#define IPA_FILTER_WRITE(expr) do { ret = (expr); if (ret) return ret; } while (0)
++	if (rule->tos_eq_present) {
++		IPA_FILTER_WRITE(ipa_filter_put_8(buf, end, rule->tos_eq));
++		IPA_FILTER_WRITE(ipa_filter_pad_32(buf, end));
++	}
++
++	if (rule->protocol_eq_present) {
++		IPA_FILTER_WRITE(ipa_filter_put_8(buf, end, rule->protocol_eq));
++		IPA_FILTER_WRITE(ipa_filter_pad_32(buf, end));
++	}
++
++	for (i = 0; i < rule->num_offset_meq_32; i++) {
++		IPA_FILTER_WRITE(ipa_filter_put_8(buf, end,
++					      rule->offset_meq_32[i].offset));
++		IPA_FILTER_WRITE(ipa_filter_put_32(buf, end,
++					       rule->offset_meq_32[i].mask));
++		IPA_FILTER_WRITE(ipa_filter_put_32(buf, end,
++					       rule->offset_meq_32[i].value));
++		IPA_FILTER_WRITE(ipa_filter_pad_32(buf, end));
++	}
++
++	for (i = 0; i < rule->num_ihl_offset_range_16; i++) {
++		IPA_FILTER_WRITE(ipa_filter_put_8(buf, end,
++					      rule->ihl_offset_range_16[i].offset));
++		IPA_FILTER_WRITE(ipa_filter_put_16(buf, end,
++					       rule->ihl_offset_range_16[i].high));
++		IPA_FILTER_WRITE(ipa_filter_put_16(buf, end,
++					       rule->ihl_offset_range_16[i].low));
++		IPA_FILTER_WRITE(ipa_filter_pad_32(buf, end));
++	}
++
++	if (rule->ihl_offset_eq_16_present) {
++		IPA_FILTER_WRITE(ipa_filter_put_8(buf, end,
++					      rule->ihl_offset_eq_16.offset));
++		IPA_FILTER_WRITE(ipa_filter_put_16(buf, end,
++					       rule->ihl_offset_eq_16.value));
++		IPA_FILTER_WRITE(ipa_filter_pad_32(buf, end));
++	}
++
++	if (rule->ihl_offset_eq_32_present) {
++		IPA_FILTER_WRITE(ipa_filter_put_8(buf, end,
++					      rule->ihl_offset_eq_32.offset));
++		IPA_FILTER_WRITE(ipa_filter_put_32(buf, end,
++					       rule->ihl_offset_eq_32.value));
++		IPA_FILTER_WRITE(ipa_filter_pad_32(buf, end));
++	}
++
++	if (rule->num_ihl_offset_meq_32) {
++		IPA_FILTER_WRITE(ipa_filter_put_8(buf, end,
++					      rule->ihl_offset_meq_32[0].offset));
++		IPA_FILTER_WRITE(ipa_filter_put_32(buf, end,
++					       rule->ihl_offset_meq_32[0].mask));
++		IPA_FILTER_WRITE(ipa_filter_put_32(buf, end,
++					       rule->ihl_offset_meq_32[0].value));
++		IPA_FILTER_WRITE(ipa_filter_pad_32(buf, end));
++	}
++
++	for (i = 0; i < rule->num_offset_meq_128; i++) {
++		IPA_FILTER_WRITE(ipa_filter_put_8(buf, end,
++					      rule->offset_meq_128[i].offset));
++		if (end - *buf < 32)
++			return -ENOSPC;
++		memcpy(*buf, rule->offset_meq_128[i].mask, 16);
++		*buf += 16;
++		memcpy(*buf, rule->offset_meq_128[i].value, 16);
++		*buf += 16;
++		IPA_FILTER_WRITE(ipa_filter_pad_32(buf, end));
++	}
++
++	if (rule->tc_eq_present) {
++		IPA_FILTER_WRITE(ipa_filter_put_8(buf, end, rule->tc_eq));
++		IPA_FILTER_WRITE(ipa_filter_pad_32(buf, end));
++	}
++
++	if (rule->flow_eq_present) {
++		IPA_FILTER_WRITE(ipa_filter_put_32(buf, end, rule->flow_eq));
++		IPA_FILTER_WRITE(ipa_filter_pad_32(buf, end));
++	}
++
++	if (rule->num_ihl_offset_meq_32 > 1) {
++		IPA_FILTER_WRITE(ipa_filter_put_8(buf, end,
++					      rule->ihl_offset_meq_32[1].offset));
++		IPA_FILTER_WRITE(ipa_filter_put_32(buf, end,
++					       rule->ihl_offset_meq_32[1].mask));
++		IPA_FILTER_WRITE(ipa_filter_put_32(buf, end,
++					       rule->ihl_offset_meq_32[1].value));
++		IPA_FILTER_WRITE(ipa_filter_pad_32(buf, end));
++	}
++
++	if (rule->metadata_meq32_present) {
++		IPA_FILTER_WRITE(ipa_filter_put_8(buf, end,
++					      rule->metadata_meq32.offset));
++		IPA_FILTER_WRITE(ipa_filter_put_32(buf, end,
++					       rule->metadata_meq32.mask));
++		IPA_FILTER_WRITE(ipa_filter_put_32(buf, end,
++					       rule->metadata_meq32.value));
++		IPA_FILTER_WRITE(ipa_filter_pad_32(buf, end));
++	}
++
++	if (rule->ipv4_frag_eq_present)
++		IPA_FILTER_WRITE(ipa_filter_pad_32(buf, end));
++#undef IPA_FILTER_WRITE
++
++	return 0;
++}
++
++static int ipa_filter_emit_rule(const struct ipa_qmi_filter_rule *rule,
++				u8 **buf, const u8 *end)
++{
++	u32 action, header;
++	int ret;
++
++	switch (rule->action) {
++	case 1: /* QMI_IPA_FILTER_ACTION_SRC_NAT */
++		action = 1; /* IPA_PASS_TO_SRC_NAT */
++		break;
++	case 2: /* QMI_IPA_FILTER_ACTION_DST_NAT */
++		action = 2; /* IPA_PASS_TO_DST_NAT */
++		break;
++	case 3: /* QMI_IPA_FILTER_ACTION_ROUTING */
++		action = 0; /* IPA_PASS_TO_ROUTING */
++		break;
++	case 4: /* QMI_IPA_FILTER_ACTION_EXCEPTION */
++		action = 3; /* IPA_PASS_TO_EXCEPTION */
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++
++	if (action != 3 &&
++	    (!rule->route_table_index_valid ||
++	     rule->route_table_index > IPA_QMI_MODEM_ROUTE_MAX))
++		return -EINVAL;
++
++	header = rule->filter_rule.rule_eq_bitmap | (action << 16) |
++		 (rule->route_table_index << 21) | BIT(26); /* retain_hdr */
++	ret = ipa_filter_put_32(buf, end, header);
++	if (ret)
++		return ret;
++
++	return ipa_filter_emit_eq(&rule->filter_rule, buf, end);
++}
++
++static int ipa_filter_build(struct ipa *ipa,
++			    const struct ipa_qmi_filter_rule *rules, u8 count,
++			    u32 ip_type, struct ipa_dma_obj *table, u8 *matched)
++{
++	u8 *buf, *end;
++	u8 i;
++	int ret;
++
++	for (i = 0; i < count; i++)
++		if (rules[i].ip_type == ip_type)
++			(*matched)++;
++
++	if (!*matched)
++		return 0;
++
++	ret = ipa_dma_alloc(ipa, table, IPA_QMI_FILTER_TABLE_SIZE);
++	if (ret)
++		return ret;
++
++	memset(table->virt, 0, table->size);
++	buf = table->virt;
++	end = buf + table->size;
++	for (i = 0; i < count; i++) {
++		if (rules[i].ip_type != ip_type)
++			continue;
++
++		ret = ipa_filter_emit_rule(&rules[i], &buf, end - sizeof(u32));
++		if (ret)
++			goto err_free;
++	}
++
++	ret = ipa_filter_put_32(&buf, end, 0); /* rule-set terminator */
++	if (ret)
++		goto err_free;
++
++	return 0;
++
++err_free:
++	dev_err(ipa->dev, "invalid modem %s filter rule: %d\n",
++		ip_type == 1 ? "IPv4" : "IPv6", ret);
++	ipa_dma_free(table);
++	return ret;
++}
++
++static int ipa_filter_update_pointer(struct ipa *ipa, enum ipa_part_id mem_id,
++				     dma_addr_t table_addr)
++{
++	struct ipa_dma_obj pointer = { }, cmd_args = { };
++	struct fifo_desc desc;
++	union ipa_cmd *cmd;
++	int ret, reserved;
++
++	ret = ipa_dma_alloc(ipa, &pointer, sizeof(u32));
++	if (ret)
++		return ret;
++	put_unaligned_le32(table_addr, pointer.virt);
++
++	ret = ipa_dma_alloc(ipa, &cmd_args, sizeof(*cmd));
++	if (ret)
++		goto free_pointer;
++
++	cmd = cmd_args.virt;
++	cmd->dma_smem.system_addr = pointer.addr;
++	cmd->dma_smem.local_addr = ipa->layout[mem_id].offset + 8 + EP_TX * 4;
++	cmd->dma_smem.size = sizeof(u32);
++	ipa_setup_cmd_desc(&desc, IPA_CMD_DMA_SHARED_MEM, &cmd_args, cmd);
++
++	reserved = ipa_reserve_descs(&ipa->ep[EP_CMD], 1);
++	if (reserved != 1) {
++		ret = -EBUSY;
++		goto free_cmd;
++	}
++
++	ret = ipa_submit_sync(&ipa->ep[EP_CMD], &desc, 1);
++	ipa_release_descs(&ipa->ep[EP_CMD], reserved);
++
++free_cmd:
++	ipa_dma_free(&cmd_args);
++free_pointer:
++	ipa_dma_free(&pointer);
++	return ret;
++}
++
++static void ipa_filter_replace(struct ipa *ipa, unsigned int family,
++			       struct ipa_dma_obj *table)
++{
++	ipa_dma_free(&ipa->modem_filter_prev[family]);
++	ipa->modem_filter_prev[family] = ipa->modem_filter[family];
++	ipa->modem_filter[family] = *table;
++	memset(table, 0, sizeof(*table));
++}
++
++/*
++ * A zero-length INSTALL_FILTER_RULE request removes the tables installed by
++ * the previous data call.  Downstream performs the equivalent delete before
++ * it acknowledges the modem, so do this through the command pipe rather
++ * than merely forgetting the cached DMA buffers.
++ */
++int ipa_clear_modem_filters(struct device *dev)
++{
++	struct ipa *ipa = dev_get_drvdata(dev);
++	struct ipa_dma_obj empty = { };
++	int ret;
++
++	if (!ipa || ipa->version != 26 || !ipa->empty_rt.size)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&ipa->filter_lock);
++	ret = ipa_filter_update_pointer(ipa, MEM_FT_V4, ipa->empty_rt.addr);
++	if (ret)
++		goto out_unlock;
++	ret = ipa_filter_update_pointer(ipa, MEM_FT_V6, ipa->empty_rt.addr);
++	if (ret)
++		goto out_unlock;
++
++	ipa_filter_replace(ipa, 0, &empty);
++	ipa_filter_replace(ipa, 1, &empty);
++	dev_info(dev, "cleared modem uplink filters\n");
++
++out_unlock:
++	mutex_unlock(&ipa->filter_lock);
++	return ret;
++}
++
++int ipa_install_modem_filters(struct device *dev,
++			      const struct ipa_qmi_filter_rule *rules, u8 count)
++{
++	struct ipa *ipa = dev_get_drvdata(dev);
++	struct ipa_dma_obj v4 = { }, v6 = { };
++	u8 v4_count = 0, v6_count = 0;
++	int ret;
++
++	if (!ipa || ipa->version != 26 || !ipa->empty_rt.size)
++		return -EOPNOTSUPP;
++	if (count > IPA_QMI_MAX_FILTERS)
++		return -EINVAL;
++	if (!count)
++		return ipa_clear_modem_filters(dev);
++	for (ret = 0; ret < count; ret++)
++		if (rules[ret].ip_type != 1 && rules[ret].ip_type != 2)
++			return -EOPNOTSUPP;
++
++	mutex_lock(&ipa->filter_lock);
++	ret = ipa_filter_build(ipa, rules, count, 1, &v4, &v4_count);
++	if (ret)
++		goto out_unlock;
++	ret = ipa_filter_build(ipa, rules, count, 2, &v6, &v6_count);
++	if (ret)
++		goto out_free_v4;
++
++	ret = ipa_filter_update_pointer(ipa, MEM_FT_V4,
++					v4_count ? v4.addr : ipa->empty_rt.addr);
++	if (ret)
++		goto out_free_v6;
++	ipa_filter_replace(ipa, 0, &v4);
++
++	ret = ipa_filter_update_pointer(ipa, MEM_FT_V6,
++					v6_count ? v6.addr : ipa->empty_rt.addr);
++	if (ret)
++		goto out_free_v6;
++	ipa_filter_replace(ipa, 1, &v6);
++
++	dev_info(dev, "installed %u modem uplink filters (%u IPv4, %u IPv6)\n",
++		 count, v4_count, v6_count);
++	mutex_unlock(&ipa->filter_lock);
++	return 0;
++
++out_free_v6:
++	ipa_dma_free(&v6);
++out_free_v4:
++	ipa_dma_free(&v4);
++out_unlock:
++	mutex_unlock(&ipa->filter_lock);
++	return ret;
++}
++
+ static void ipa_reset_hw(struct ipa *ipa)
+ {
+ 	iowrite32(1, ipa->mmio + REG_IPA_COMP_SW_RESET_OFST);
+@@ -445,6 +859,50 @@ static void ipa_partition_put(struct ipa *ipa, u32 *offset,
+ 	*offset = *offset + size_words * 4;
+ }
+ 
++static void ipa_partition_set(struct ipa *ipa, enum ipa_part_id id,
++				      u32 offset, u32 size)
++{
++	ipa->layout[id].offset = offset + ipa->smem_restr_bytes;
++	ipa->layout[id].size = size;
++}
++
++static int ipa_partition_sdm660(struct ipa *ipa)
++{
++	static const u16 canary_offsets[] = {
++		0x280, 0x284, 0x2e0, 0x2e4, 0x340, 0x344,
++		0x384, 0x3c4, 0x508, 0x50c, 0x710, 0x1ffc,
++	};
++	void __iomem *sram;
++	int i;
++
++	if (ipa->smem_size < IPA_V2_6L_SMEM_SIZE) {
++		dev_err(ipa->dev, "IPA v2.6L requires 0x%x bytes of SRAM\\n",
++			IPA_V2_6L_SMEM_SIZE);
++		return -EINVAL;
++	}
++
++	sram = ipa->mmio + REG_IPA_SRAM_SW_FIRST_v2_5;
++	for (i = 0; i < ARRAY_SIZE(canary_offsets); i++)
++		iowrite32(0xdeadbeaf, sram + canary_offsets[i]);
++
++	ipa_partition_set(ipa, MEM_FT_V4, IPA_V2_6L_V4_FT_OFF,
++				  IPA_V2_6L_FT_SIZE);
++	ipa_partition_set(ipa, MEM_FT_V6, IPA_V2_6L_V6_FT_OFF,
++				  IPA_V2_6L_FT_SIZE);
++	ipa_partition_set(ipa, MEM_RT_V4, IPA_V2_6L_V4_RT_OFF,
++				  IPA_V2_6L_RT_SIZE);
++	ipa_partition_set(ipa, MEM_RT_V6, IPA_V2_6L_V6_RT_OFF,
++				  IPA_V2_6L_RT_SIZE);
++	ipa_partition_set(ipa, MEM_MDM_HDR, IPA_V2_6L_MDM_HDR_OFF,
++				  IPA_V2_6L_MDM_HDR_SIZE);
++	ipa_partition_set(ipa, MEM_MDM_COMP, IPA_V2_6L_MDM_COMP_OFF,
++				  IPA_V2_6L_MDM_COMP_SIZE);
++	ipa_partition_set(ipa, MEM_MDM, IPA_V2_6L_MDM_OFF,
++				  IPA_V2_6L_MDM_SIZE);
++
++	return 0;
++}
++
+ static int ipa_partition_mem(struct ipa *ipa)
+ {
+ 	u32 offset, val;
+@@ -459,6 +917,9 @@ static int ipa_partition_mem(struct ipa *ipa)
+ 		return -EINVAL;
+ 
+ 	ipa->smem_size -= ipa->smem_restr_bytes;
++	if (ipa->version == 26)
++		return ipa_partition_sdm660(ipa);
++
+ 	offset = 0x280;
+ 
+ 	ipa_partition_put(ipa, &offset, MEM_FT_V4, IPA_NUM_PIPES + 2, 2);
+@@ -529,15 +990,21 @@ static int ipa_init_sram_part(struct ipa *ipa, enum ipa_part_id mem_id)
+ 	case MEM_RT_V4:
+ 	case MEM_RT_V6:
+ 		end = pld.virt + pld.size;
+-		val = ipa->layout[MEM_DRV].offset - part_offset;
+ 
+-		while (payload <= end)
+-			*(payload++) = val | 1;
++		if (ipa->version == 26) {
++			val = ipa->empty_rt.addr;
++			while (payload < end)
++				*(payload++) = val;
++		} else {
++			val = ipa->layout[MEM_DRV].offset - part_offset;
++			while (payload <= end)
++				*(payload++) = val | 1;
++		}
+ 	default:
+ 		break;
+ 	}
+ 
+-	if (ipa->test_mode) {
++	if (ipa->test_mode && ipa->version != 26) {
+ 		payload = pld.virt;
+ 		val = ipa->layout[MEM_DRV].offset - part_offset + 1;
+ 		if (mem_id == MEM_FT_V4) {
+@@ -551,6 +1018,19 @@ static int ipa_init_sram_part(struct ipa *ipa, enum ipa_part_id mem_id)
+ 
+ 	switch (mem_id) {
+ 	case MEM_MDM_HDR:
++		/*
++		 * IPA v2.6L initializes its modem-header SRAM once, locally.
++		 * This is the sequence used by the SDM660 downstream driver.
++		 */
++		if (ipa->version == 26) {
++			cmd->hdr_local_init.hdr_table_src_addr = pld.addr;
++			cmd->hdr_local_init.hdr_table_dst_addr = part_offset;
++			cmd->hdr_local_init.size_hdr_table = part->size;
++			ipa_setup_cmd_desc(desc++, IPA_CMD_HDR_LOCAL_INIT,
++					   &cmd_args, cmd++);
++			break;
++		}
++
+ 		ret = devm_ipa_dma_alloc(ipa, &ipa->system_hdr, 2048);
+ 		if (ret)
+ 			goto free_pld;
+@@ -677,9 +1157,12 @@ static irqreturn_t ipa_isr_thread(int irq, void *data)
+ 	if (val & BIT(IPA_IRQ_UC_IRQ_1)) {
+ 		val = ioread32(ipa->mmio + REG_IPA_UC_RESP);
+ 		val &= IPA_UC_RESP_OP_MASK;
+-		if (ipa->qmi && val == IPA_UC_RESPONSE_INIT_COMPLETED) {
+-			ipa_qmi_uc_loaded(ipa->qmi);
+-			ipa->smem_uc_loaded[0] = 0x10ADEDFF;
++		if (val == IPA_UC_RESPONSE_INIT_COMPLETED) {
++			ipa->uc_loaded = true;
++			if (ipa->qmi)
++				ipa_qmi_uc_loaded(ipa->qmi);
++			if (ipa->version != 26)
++				ipa->smem_uc_loaded[0] = 0x10ADEDFF;
+ 		} else if (ipa->qmi && val == IPA_UC_RESPONSE_CMD_COMPLETED) {
+ 			wake_up_all(&ipa->uc_cmd_wq);
+ 		}
+@@ -1113,3 +1588,48 @@
+ }
++static int ipa_smmu_uc_probe(struct platform_device *pdev)
++{
++	struct iommu_domain *domain;
++	struct device *dev = &pdev->dev;
++	int ret;
++
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to set 32-bit DMA mask\n");
++
++	domain = iommu_get_domain_for_dev(dev);
++	if (!domain)
++		return -EPROBE_DEFER;
++
++	if (domain->type != IOMMU_DOMAIN_IDENTITY)
++		return dev_err_probe(dev, -EINVAL,
++				     "uC SMMU stream is not in an identity domain\n");
++
++	platform_set_drvdata(pdev, domain);
++
++	return 0;
++}
++
++static int ipa_smmu_uc_ready(struct device *dev)
++{
++	struct device_node *np;
++	struct platform_device *pdev;
++	int ret = 0;
++
++	np = of_get_compatible_child(dev->of_node, "qcom,ipa-smmu-uc-cb");
++	if (!np)
++		return -ENODEV;
++
++	pdev = of_find_device_by_node(np);
++	of_node_put(np);
++	if (!pdev)
++		return -EPROBE_DEFER;
++
++	if (!platform_get_drvdata(pdev))
++		ret = -EPROBE_DEFER;
++
++	put_device(&pdev->dev);
++
++	return ret;
++}
+ 
+ static int ipa_probe(struct platform_device *pdev)
+@@ -1130,7 +1677,28 @@ static int ipa_probe(struct platform_device *pdev)
+ 
+ 	atomic_set(&ipa->uc_cmd_busy, 0);
+ 	init_waitqueue_head(&ipa->uc_cmd_wq);
++	mutex_init(&ipa->filter_lock);
+ 	platform_set_drvdata(pdev, ipa);
++	for (ep = 0; ep < ARRAY_SIZE(ipa->modem_filter); ep++) {
++		ret = devm_add_action_or_reset(dev, action_ipa_dma_free,
++					       &ipa->modem_filter[ep]);
++		if (ret)
++			return ret;
++		ret = devm_add_action_or_reset(dev, action_ipa_dma_free,
++					       &ipa->modem_filter_prev[ep]);
++		if (ret)
++			return ret;
++	}
++
++	ret = devm_of_platform_populate(dev);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "failed to create IPA uC SMMU device\n");
++
++	ret = ipa_smmu_uc_ready(dev);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "IPA uC SMMU device is not ready\n");
+ 
+ 	ipa->mmio = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR_OR_NULL(ipa->mmio))
+@@ -1151,6 +1719,13 @@ static int ipa_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	if (ipa->version == 26) {
++		ret = devm_ipa_dma_alloc(ipa, &ipa->empty_rt, sizeof(u32));
++		if (ret)
++			return ret;
++		*(u32 *)ipa->empty_rt.virt = 0;
++	}
++
+ 	for (ep = 0; ep < EP_NUM; ep++) {
+ 		ret = ipa_setup_ep(ipa, ep);
+ 		if (ret)
+@@ -1223,8 +1798,12 @@ static int ipa_probe(struct platform_device *pdev)
+ 	if (IS_ERR(ipa->qmi))
+ 		return PTR_ERR(ipa->qmi);
+ 
+-	if (ipa->smem_uc_loaded[0] == 0x10ADEDFF)
++	if (ipa->version == 26) {
++		if (ipa->uc_loaded)
++			ipa_qmi_uc_loaded(ipa->qmi);
++	} else if (ipa->smem_uc_loaded[0] == 0x10ADEDFF) {
+ 		ipa_qmi_uc_loaded(ipa->qmi);
++	}
+ 
+ 	return devm_add_action_or_reset(dev, action_ipa_qmi_teardown, ipa);
+ }
+@@ -1337,8 +1916,43 @@ static struct platform_driver ipa2_lite_driver = {
+ 	},
+ };
+ 
+-module_platform_driver(ipa2_lite_driver);
++static const struct of_device_id ipa_smmu_uc_match[] = {
++	{ .compatible = "qcom,ipa-smmu-uc-cb" },
++	{ },
++};
++
++static struct platform_driver ipa_smmu_uc_driver = {
++	.probe = ipa_smmu_uc_probe,
++	.driver = {
++		.name = "ipa-smmu-uc",
++		.of_match_table = ipa_smmu_uc_match,
++	},
++};
++
++static int __init ipa2_lite_init(void)
++{
++	int ret;
++
++	ret = platform_driver_register(&ipa_smmu_uc_driver);
++	if (ret)
++		return ret;
++
++	ret = platform_driver_register(&ipa2_lite_driver);
++	if (ret)
++		platform_driver_unregister(&ipa_smmu_uc_driver);
++
++	return ret;
++}
++module_init(ipa2_lite_init);
++
++static void __exit ipa2_lite_exit(void)
++{
++	platform_driver_unregister(&ipa2_lite_driver);
++	platform_driver_unregister(&ipa_smmu_uc_driver);
++}
++module_exit(ipa2_lite_exit);
+ 
+ MODULE_DEVICE_TABLE(of, ipa_match);
++MODULE_DEVICE_TABLE(of, ipa_smmu_uc_match);
+ MODULE_LICENSE("GPL");
+ MODULE_DESCRIPTION("Qualcomm IP Accelerator v2.X driver");
+diff --git a/drivers/net/ipa2-lite/ipa.h b/drivers/net/ipa2-lite/ipa.h
+index 47909d2ba672f581b0d08be20cd6998e95f353b0..8d8b45003e2b96891b38e29f471fa27783059a92 100644
+--- a/drivers/net/ipa2-lite/ipa.h
++++ b/drivers/net/ipa2-lite/ipa.h
+@@ -29,6 +29,81 @@ struct ipa_partition {
+ 	u16 offset, size;
+ };
+ 
++#define IPA_QMI_MAX_FILTERS	35
++
++/*
++ * IPA filter equations as sent by the modem in INSTALL_FILTER_RULE (0x23).
++ * These follow the IPA v2 QMI service definition used by the SDM660
++ * downstream driver.  Keeping the decoded representation here lets the QMI
++ * server and the IPA command code remain separate.
++ */
++struct ipa_qmi_eq_16 {
++	u8 offset;
++	u16 value;
++};
++
++/* This is an equality equation, not a masked equation. */
++struct ipa_qmi_eq_32 {
++	u8 offset;
++	u32 value;
++};
++
++struct ipa_qmi_range_eq_16 {
++	u8 offset;
++	u16 low;
++	u16 high;
++};
++
++struct ipa_qmi_mask_eq_32 {
++	u8 offset;
++	u32 mask;
++	u32 value;
++};
++
++struct ipa_qmi_mask_eq_128 {
++	u8 offset;
++	u8 mask[16];
++	u8 value[16];
++};
++
++struct ipa_qmi_filter_data {
++	u16 rule_eq_bitmap;
++	u8 tos_eq_present;
++	u8 tos_eq;
++	u8 protocol_eq_present;
++	u8 protocol_eq;
++	u8 num_ihl_offset_range_16;
++	struct ipa_qmi_range_eq_16 ihl_offset_range_16[2];
++	u8 num_offset_meq_32;
++	struct ipa_qmi_mask_eq_32 offset_meq_32[2];
++	u8 tc_eq_present;
++	u8 tc_eq;
++	u8 flow_eq_present;
++	u32 flow_eq;
++	u8 ihl_offset_eq_16_present;
++	struct ipa_qmi_eq_16 ihl_offset_eq_16;
++	u8 ihl_offset_eq_32_present;
++	struct ipa_qmi_eq_32 ihl_offset_eq_32;
++	u8 num_ihl_offset_meq_32;
++	struct ipa_qmi_mask_eq_32 ihl_offset_meq_32[2];
++	u8 num_offset_meq_128;
++	struct ipa_qmi_mask_eq_128 offset_meq_128[2];
++	u8 metadata_meq32_present;
++	struct ipa_qmi_mask_eq_32 metadata_meq32;
++	u8 ipv4_frag_eq_present;
++};
++
++struct ipa_qmi_filter_rule {
++	u32 identifier;
++	u32 ip_type;
++	struct ipa_qmi_filter_data filter_rule;
++	u32 action;
++	u8 route_table_index_valid;
++	u32 route_table_index;
++	u8 mux_id_valid;
++	u32 mux_id;
++};
++
+ struct device;
+ struct ipa_qmi;
+ 
+@@ -36,4 +111,8 @@ struct ipa_qmi *ipa_qmi_setup(struct device *dev, const struct ipa_partition *la
+ bool ipa_qmi_is_modem_ready(struct ipa_qmi *ipa_qmi);
+ void ipa_qmi_uc_loaded(struct ipa_qmi *ipa_qmi);
+ void ipa_qmi_teardown(struct ipa_qmi *ipa_qmi);
++int ipa_qmi_apply_modem_filters(struct ipa_qmi *ipa_qmi);
+ void ipa_modem_set_present(struct device *dev, bool present);
++int ipa_install_modem_filters(struct device *dev,
++			      const struct ipa_qmi_filter_rule *rules, u8 count);
++int ipa_clear_modem_filters(struct device *dev);
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -399,17 +399,10 @@
+ 			    const struct ipa_qmi_filter_rule *rules, u8 count,
+ 			    u32 ip_type, struct ipa_dma_obj *table, u8 *matched)
+ {
+-	u8 *buf, *end;
++	u8 *buf, *end, *rule_start;
+ 	u8 i;
+ 	int ret;
+ 
+-	for (i = 0; i < count; i++)
+-		if (rules[i].ip_type == ip_type)
+-			(*matched)++;
+-
+-	if (!*matched)
+-		return 0;
+-
+ 	ret = ipa_dma_alloc(ipa, table, IPA_QMI_FILTER_TABLE_SIZE);
+ 	if (ret)
+ 		return ret;
+@@ -421,9 +414,24 @@
+ 		if (rules[i].ip_type != ip_type)
+ 			continue;
+ 
++		rule_start = buf;
+ 		ret = ipa_filter_emit_rule(&rules[i], &buf, end - sizeof(u32));
++		if (ret == -EINVAL || ret == -EOPNOTSUPP) {
++			buf = rule_start;
++			dev_warn(ipa->dev,
++				 "skipping unsupported modem filter %u (id=%#x ip=%u action=%u): %d\n",
++				 i, rules[i].identifier, rules[i].ip_type,
++				 rules[i].action, ret);
++			continue;
++		}
+ 		if (ret)
+ 			goto err_free;
++		(*matched)++;
++	}
++
++	if (!*matched) {
++		ipa_dma_free(table);
++		return 0;
+ 	}
+ 
+ 	ret = ipa_filter_put_32(&buf, end, 0); /* rule-set terminator */
+@@ -533,9 +541,13 @@
+ 		return -EINVAL;
+ 	if (!count)
+ 		return ipa_clear_modem_filters(dev);
+-	for (ret = 0; ret < count; ret++)
+-		if (rules[ret].ip_type != 1 && rules[ret].ip_type != 2)
+-			return -EOPNOTSUPP;
++	for (ret = 0; ret < count; ret++) {
++		if (rules[ret].ip_type == 1 || rules[ret].ip_type == 2)
++			continue;
++		dev_warn(dev,
++			 "skipping modem filter %d with unsupported IP type %u (id=%#x)\n",
++			 ret, rules[ret].ip_type, rules[ret].identifier);
++	}
+ 
+ 	mutex_lock(&ipa->filter_lock);
+ 	ret = ipa_filter_build(ipa, rules, count, 1, &v4, &v4_count);
+@@ -665,7 +677,9 @@
+ 	case EP_TX:
+ 	case EP_TEST_TX:
+ 		iowrite32(ipa->test_mode ? 0xc4 : 0x44, ipa->mmio + REG_IPA_EP_HDR(id));
+-		iowrite32(0x00000001, ipa->mmio + REG_IPA_EP_HDR_EXT(id));
++		/* QMAP is big-endian; downstream leaves HDR_ENDIANNESS clear. */
++		iowrite32(ipa->test_mode ? 0x00000001 : 0x00000000,
++			  ipa->mmio + REG_IPA_EP_HDR_EXT(id));
+ 		iowrite32(0x00000005, ipa->mmio + REG_IPA_EP_STATUS(id));
+ 		iowrite32(0x00000007, ipa->mmio + REG_IPA_EP_ROUTE(id));
+ 		iowrite32(0x00000020, ipa->mmio + REG_IPA_EP_MODE(id));
+@@ -673,7 +687,9 @@
+ 	case EP_RX:
+ 	case EP_TEST_RX:
+ 		iowrite32(0x002800c4, ipa->mmio + REG_IPA_EP_HDR(id));
+-		iowrite32(0x0000000b, ipa->mmio + REG_IPA_EP_HDR_EXT(id));
++		/* total-length valid + payload padding, with big-endian QMAP. */
++		iowrite32(ipa->test_mode ? 0x0000000b : 0x0000000a,
++			  ipa->mmio + REG_IPA_EP_HDR_EXT(id));
+ 		iowrite32(0xff000000, ipa->mmio + REG_IPA_EP_HDR_METADATA_MASK(id));
+ 	default:
+ 		break;
+@@ -784,6 +800,8 @@
+ 	iowrite32(0, ipa->mmio + REG_IPA_UC_RESP);
+ 	iowrite32(0, ipa->mmio + REG_IPA_UC_RESP_PARAM);
+ 
++	/* Publish command and parameters before interrupting the microcontroller. */
++	wmb();
+ 	iowrite32(1, ipa->mmio + REG_IPA_IRQ_UC_EE0);
+ 
+ 	ret = wait_event_timeout(ipa->uc_cmd_wq,
+@@ -808,18 +826,47 @@
+ 	return 0;
+ }
+ 
++static void ipa_bam_reset_q6_pipe(struct ipa *ipa, u8 pipe)
++{
++	void __iomem *mmio = ipa->mmio;
++	u32 rd_off, wr_off;
++
++	iowrite32(0, mmio + REG_BAM_P_CTRL(pipe));
++	iowrite32(1, mmio + REG_BAM_P_RST(pipe));
++	wmb();
++	iowrite32(0, mmio + REG_BAM_P_RST(pipe));
++	iowrite32(0, mmio + REG_BAM_P_RD_OFF_REG(pipe));
++	iowrite32(0, mmio + REG_BAM_P_WR_OFF_REG(pipe));
++	wmb();
++
++	rd_off = ioread32(mmio + REG_BAM_P_RD_OFF_REG(pipe));
++	wr_off = ioread32(mmio + REG_BAM_P_WR_OFF_REG(pipe));
++	dev_warn(ipa->dev,
++		 "uC unavailable; reset Q6 BAM pipe %u directly (rd=%#x wr=%#x)\n",
++		 pipe, rd_off, wr_off);
++}
++
+ static void ipa_reset_modem_pipes(struct ipa *ipa)
+ {
+ 	/* For 2.5+ */
+ 	u8 pipes[] = { 6, 7, 11, 13, 8, 9, 12, 14 };
++	bool direct_reset = false;
+ 	int i, ret;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(pipes); i++) {
++		if (direct_reset) {
++			ipa_bam_reset_q6_pipe(ipa, pipes[i]);
++			continue;
++		}
++
+ 		ret = ipa_uc_send_cmd(ipa, IPA_UC_CMD_RESET_PIPE,
+ 				      IPA_UC_CMD_RESET_PIPE_PARAM(pipes[i], i >= 4), 0);
+-		if (ret)
++		if (ret) {
+ 			dev_err(ipa->dev, "failed to reset %d pipe: %d\n",
+ 				pipes[i], ret);
++			direct_reset = true;
++			ipa_bam_reset_q6_pipe(ipa, pipes[i]);
++		}
+ 	}
+ }
+ 
+@@ -1433,6 +1480,13 @@
+ 	}
+ 
+ 	netif_start_queue(ndev);
++	if (ipa_ndev->tx && ipa->qmi) {
++		ret = ipa_qmi_apply_modem_filters(ipa->qmi);
++		if (ret)
++			dev_warn(ipa->dev,
++				 "modem filter installation/notification failed: %d\n",
++				 ret);
++	}
+ 
+ 	return 0;
+ 
+@@ -1511,7 +1565,7 @@
+ 	ndev->addr_len = 0;
+ 	ndev->hard_header_len = 0;
+ 	ndev->min_header_len = ETH_HLEN;
+-	ndev->needed_headroom = 4; /* QMAP_HDR */
++	ndev->needed_headroom = 8; /* Downstream HEADROOM_FOR_QMAP */
+ 	ndev->mtu = IPA_RX_LEN - 32 - 4; /* STATUS + QMAP_HDR */
+ 	ndev->max_mtu = ndev->mtu;
+ 	ndev->needed_tailroom = 0;
+--- a/drivers/net/ipa2-lite/ipa-qmi.c
++++ b/drivers/net/ipa2-lite/ipa-qmi.c
+@@ -1589,13 +1589,6 @@
+ 		return;
+ 	}
+ 
+-	/*
+-	 * The first 256 bytes contain the QMI header and the beginning of the
+-	 * legacy filter-spec list.  This is control-plane data (not user traffic)
+-	 * and lets us validate a firmware/IDL mismatch without guessing fields.
+-	 */
+-	print_hex_dump(KERN_INFO, "ipa QMI 0x23: ", DUMP_PREFIX_OFFSET,
+-		       16, 1, data, min_t(size_t, count, 256), false);
+ 	ret = qmi_decode_message(data, count, ipa_qmi_install_filter_req_ei, req);
+ 	if (ret < 0 || !req->rules_valid ||
+ 	    req->rules_len > IPA_QMI_MAX_FILTERS ||
+@@ -1631,20 +1624,28 @@
+ 	ipa_qmi->filter_rules_pending = true;
+ 	mutex_unlock(&ipa_qmi->filter_lock);
+ 
+-	if (req->rules_len)
++	if (req->rules_len) {
+ 		dev_info(ipa_qmi->dev,
+-			 "cached %u modem filters: local pipe=%u, requested pipe=%u%s, v4=%u%s, v6=%u%s, xlat=%u; first id=%#x ip=%u action=%u bitmap=%#x route=%u\n",
++			 "cached %u modem filters: local pipe=%u, requested pipe=%u%s, v4=%u%s, v6=%u%s, xlat=%u\n",
+ 			 req->rules_len, ipa_qmi->filter_source_pipe,
+ 			 req->source_pipe_index,
+ 			 req->source_pipe_index_valid ? "" : "?",
+ 			 req->num_ipv4_filters, req->num_ipv4_filters_valid ? "" : "?",
+ 			 req->num_ipv6_filters, req->num_ipv6_filters_valid ? "" : "?",
+-			 req->xlat_filter_indices_len, req->rules[0].identifier,
+-			 req->rules[0].ip_type, req->rules[0].action,
+-			 req->rules[0].filter_rule.rule_eq_bitmap,
+-			 req->rules[0].route_table_index);
+-	else
++			 req->xlat_filter_indices_len);
++		for (i = 0; i < req->rules_len; i++)
++			dev_info(ipa_qmi->dev,
++				 "modem filter %u: id=%#x ip=%u action=%u bitmap=%#x route=%u%s mux=%u%s\n",
++				 i, req->rules[i].identifier, req->rules[i].ip_type,
++				 req->rules[i].action,
++				 req->rules[i].filter_rule.rule_eq_bitmap,
++				 req->rules[i].route_table_index,
++				 req->rules[i].route_table_index_valid ? "" : "?",
++				 req->rules[i].mux_id,
++				 req->rules[i].mux_id_valid ? "" : "?");
++	} else {
+ 		dev_info(ipa_qmi->dev, "cached modem filter-table clear request\n");
++	}
+ 
+ 	rsp.rsp.result = QMI_RESULT_SUCCESS_V01;
+ 	rsp.rsp.error = QMI_ERR_NONE_V01;
+@@ -1779,7 +1780,9 @@
+ 			req.handles[i].index = v6_index++;
+ 			break;
+ 		default:
+-			return -EOPNOTSUPP;
++			/* Downstream accounts IPA_IP_MAX entries in the v6 index. */
++			req.handles[i].index = v6_index++;
++			break;
+ 		}
+ 	}
+ 

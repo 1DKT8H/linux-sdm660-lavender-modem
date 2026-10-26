@@ -1,0 +1,103 @@
+From 7f0581c2a8d7ac7d2f4ff0ea3cff449e94d9e4d1 Mon Sep 17 00:00:00 2001
+From: 1DKT8H <szymonj159@gmail.com>
+Date: Tue, 1 Sep 2026 21:45:00 +0200
+Subject: [PATCH] net: ipa2-lite: match downstream no-interrupt producer policy
+
+Qualcomm's ipa_v2 driver assigns a normally configured producer, including
+APPS_LAN_WAN_PROD, IPA_POLICY_NOINTR_MODE.  The BAM descriptor retains EOT,
+but producer completion interrupts and the producer's EE source bit are
+disabled.  Completed descriptors are collected with sps_get_iovec() before
+the next transfer.
+
+ipa2-lite instead enabled NAPI and BAM pipe interrupt mask 0x31 on the AP
+producer.  SDM660 modem data reliably crashes as the first IPv6 packet enters
+IPA, while the vendor kernel explicitly reports that IPA NAPI is disabled.
+
+Keep the receive pipe interrupt-driven, but make the transmit pipe follow the
+vendor policy.  Poll its read offset before each submission to reclaim any
+completed descriptors, leave EOT on the descriptor, and keep both levels of
+the BAM producer interrupt disabled.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+---
+ drivers/net/ipa2-lite/ipa.c | 36 ++++++++++++++++++++++++++----------
+ 1 file changed, 26 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -1362,10 +1362,8 @@ static irqreturn_t ipa_dma_isr(int irq, void *data)
+ 	return IRQ_HANDLED;
+ }
+ 
+-static int ipa_poll_tx(struct napi_struct *napi, int budget)
++static int ipa_reap_tx(struct ipa_ep *ep, struct net_device *ndev, int budget)
+ {
+-	struct ipa_ep *ep = container_of(napi, struct ipa_ndev, napi_tx[0])->tx;
+-	struct net_device *ndev = napi->dev;
+ 	struct ipa *ipa = ep->ipa;
+ 	struct device *dev = ipa->dev;
+ 	struct sk_buff *skb;
+@@ -1400,8 +1398,19 @@ static int ipa_poll_tx(struct napi_struct *napi, int budget)
+ 	ndev->stats.tx_bytes += bytes;
+ 	ndev->stats.tx_packets += packets;
+ 
+-	if (budget && done < budget && napi_complete_done(napi, done))
+-		iowrite32(IPA_PIPE_IRQ_MASK, ipa->mmio + REG_BAM_P_IRQ_EN(ep->id));
++	return done;
++}
++
++static int ipa_poll_tx(struct napi_struct *napi, int budget)
++{
++	struct ipa_ep *ep = container_of(napi, struct ipa_ndev, napi_tx[0])->tx;
++	struct net_device *ndev = napi->dev;
++	int done;
++
++	done = ipa_reap_tx(ep, ndev, budget);
++	if (done < budget && napi_complete_done(napi, done))
++		iowrite32(IPA_PIPE_IRQ_MASK,
++			  ep->ipa->mmio + REG_BAM_P_IRQ_EN(ep->id));
+ 
+ 	return done;
+ }
+@@ -1587,9 +1596,18 @@ static int ipa_ndev_open(struct net_device *ndev)
+ 		rmw32(ipa->mmio + REG_BAM_P_CTRL(ipa_ndev->tx->id), P_EN, P_EN);
+ 
+ 		iowrite32(0, ipa->mmio + REG_IPA_EP_CTRL(ipa_ndev->tx->id));
+-		napi_enable(ipa_ndev->tx->napi);
+ 
+-		iowrite32(IPA_PIPE_IRQ_MASK, ipa->mmio + REG_BAM_P_IRQ_EN(ipa_ndev->tx->id));
++		/*
++		 * Qualcomm's v2 policy uses IPA_POLICY_NOINTR_MODE for a
++		 * normally configured producer such as APPS_LAN_WAN_PROD.
++		 * EOT stays on each descriptor, but pipe completion interrupts
++		 * remain disabled and completed descriptors are polled before
++		 * the next submission.
++		 */
++		iowrite32(0, ipa->mmio +
++			 REG_BAM_P_IRQ_EN(ipa_ndev->tx->id));
++		rmw32(ipa->mmio + REG_BAM_IRQ_SRCS_MSK_EE0,
++		      BIT(ipa_ndev->tx->id), 0);
+ 	}
+ 
+ 	netif_start_queue(ndev);
+@@ -1629,7 +1647,6 @@ static int ipa_ndev_stop(struct net_device *ndev)
+ 	ipa_reset_flush_ep(ipa_ndev->rx);
+ 	if (ipa_ndev->tx) {
+ 		iowrite32(0, ipa->mmio + REG_BAM_P_IRQ_EN(ipa_ndev->tx->id));
+-		napi_disable(ipa_ndev->tx->napi);
+ 		ipa_reset_flush_ep(ipa_ndev->tx);
+ 	}
+ 
+@@ -1659,6 +1676,9 @@ static netdev_tx_t ipa_ndev_start_xmit(struct sk_buff *skb,
+ 	if (skb->protocol != htons(ETH_P_MAP) || skb_linearize(skb) || !ipa_ndev->tx)
+ 		goto drop_tx;
+ 
++	/* Match downstream's IPA_POLICY_NOINTR_MODE completion polling. */
++	ipa_reap_tx(ipa_ndev->tx, ndev, IPA_FIFO_NUM_DESC);
++
+ 	if (!ipa->tx_irq_logged) {
+ 		ipa->tx_irq_logged = true;
+ 		dev_info(ipa->dev,
+-- 
+2.51.0

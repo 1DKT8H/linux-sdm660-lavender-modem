@@ -1,0 +1,37 @@
+From: 1DKT8H <szymonj159@gmail.com>
+Subject: [PATCH] net: ipa2-lite: reassert global filtering before uplink TX
+
+The IPA v2.6L hardware returns uplink packets to the AP route with the
+FILT_PROCESS status bit clear even though the modem table is installed and
+its pointer is valid.  The modem/uC setup can clear the global IPA_FILTER
+register after the AP has populated its filter table.
+
+Reassert the global filter-enable bit immediately before sending an AP
+producer packet.  This is the same bit programmed by downstream's
+ipa_cfg_filter(false), and doing it at the producer boundary makes the
+ordering independent of the asynchronous Q6 data-call setup.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+---
+ drivers/net/ipa2-lite/ipa.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+index 20f4900..0f3cf2b 100644
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -1930,6 +1930,14 @@ static netdev_tx_t ipa_ndev_start_xmit(struct sk_buff *skb,
+ 		if (ret == 2)
+ 			return NETDEV_TX_BUSY;
+ 	}
+ 
++	/*
++	 * Q6/uC setup may clear IPA_FILTER after tables have been installed.
++	 * This is the AP producer boundary, so restore the downstream global
++	 * enable bit immediately before IPA consumes the packet.
++	 */
++	if (ipa_ndev->tx && ipa_ndev->tx->id == EP_TX)
++		iowrite32(1, ipa->mmio + REG_IPA_FILTER_OFST);
++
+ 	if (skb->protocol != htons(ETH_P_MAP) || skb_linearize(skb) || !ipa_ndev->tx)
+ 		goto drop_tx;

@@ -1,0 +1,65 @@
+From: 1DKT8H <szymonj159@gmail.com>
+Subject: [PATCH] net: ipa2-lite: make terminal family filters unconditional
+
+The modem installs separate IPv4 and IPv6 uplink tables.  It nevertheless
+terminates each list with an OFFSET_MEQ32_0 rule that checks the IP-version
+nibble (mask 0xf0, value 0x40 or 0x60) before selecting the catch-all modem
+route.  Since the hardware table itself already selects the address family,
+this comparison is redundant.
+
+Make that exact Q6-generated terminal rule unconditional by retaining its
+equation slot but using a zero mask and value.  This preserves the table
+ABI and route selection while ensuring otherwise-unmatched packets reach
+the modem route independently of IPA 2.6L byte-lane interpretation.
+
+Signed-off-by: 1DKT8H <szymonj159@gmail.com>
+---
+ drivers/net/ipa2-lite/ipa.c | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ipa2-lite/ipa.c b/drivers/net/ipa2-lite/ipa.c
+index 6e32e24..f86f4e1 100644
+--- a/drivers/net/ipa2-lite/ipa.c
++++ b/drivers/net/ipa2-lite/ipa.c
+@@ -473,6 +473,8 @@ static int ipa_filter_build(struct ipa *ipa,
+ 			    const struct ipa_qmi_filter_rule *rules, u8 count,
+ 			    u32 ip_type, struct ipa_dma_obj *table, u8 *matched)
+ {
++	struct ipa_qmi_filter_rule family_catchall;
++	const struct ipa_qmi_filter_rule *emit_rule;
+ 	u8 *buf, *end, *rule_start;
+ 	u8 i;
+ 	int ret;
+@@ -488,8 +490,29 @@ static int ipa_filter_build(struct ipa *ipa,
+ 		if (rules[i].ip_type != ip_type)
+ 			continue;
+ 
++		emit_rule = &rules[i];
++		/*
++		 * Q6 terminates each per-family list with OFFSET_MEQ32_0 on
++		 * byte zero (mask 0xf0, value 0x40/0x60).  The v4 and v6
++		 * hardware tables are already separate, so make this terminal
++		 * family guard a real catch-all.  Besides preserving its intent,
++		 * this avoids depending on byte-lane interpretation for the one
++		 * rule that must always route otherwise-unmatched traffic.
++		 */
++		if (rules[i].filter_rule.rule_eq_bitmap == BIT(2) &&
++		    rules[i].filter_rule.num_offset_meq_32 == 1 &&
++		    rules[i].filter_rule.offset_meq_32[0].offset == 0 &&
++		    rules[i].filter_rule.offset_meq_32[0].mask == 0xf0 &&
++		    (rules[i].filter_rule.offset_meq_32[0].value == 0x40 ||
++		     rules[i].filter_rule.offset_meq_32[0].value == 0x60)) {
++			family_catchall = rules[i];
++			family_catchall.filter_rule.offset_meq_32[0].mask = 0;
++			family_catchall.filter_rule.offset_meq_32[0].value = 0;
++			emit_rule = &family_catchall;
++		}
++
+ 		rule_start = buf;
+-		ret = ipa_filter_emit_rule(&rules[i], &buf, end - sizeof(u32));
++		ret = ipa_filter_emit_rule(emit_rule, &buf, end - sizeof(u32));
+ 		if (ret == -EINVAL || ret == -EOPNOTSUPP) {
+ 			buf = rule_start;
+ 			dev_warn(ipa->dev,
+-- 
+2.51.0
